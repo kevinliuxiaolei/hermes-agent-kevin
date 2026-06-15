@@ -1057,6 +1057,105 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_quota(self, request: "web.Request") -> "web.Response":
+        """GET /quota — return current quota statuses for all families."""
+        from agent.quota_registry import get_all_quota_statuses
+        try:
+            refresh = request.query.get("refresh", "").lower() in ("1", "true")
+            statuses = get_all_quota_statuses(refresh=refresh)
+            res = {}
+            for k, v in statuses.items():
+                res[k] = {
+                    "quota_family": v.quota_family,
+                    "provider_family": v.provider_family,
+                    "available": v.available,
+                    "quota_5h_percent": v.quota_5h_percent,
+                    "quota_7d_percent": v.quota_7d_percent,
+                    "reset_5h": v.reset_5h,
+                    "reset_7d": v.reset_7d,
+                    "reason": v.reason,
+                    "remaining_percent": v.remaining_percent,
+                    "reset_in": v.reset_in,
+                    "raw": v.raw
+                }
+            return web.json_response(res)
+        except Exception as e:
+            logger.exception("Failed to handle GET /quota")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_model(self, request: "web.Request") -> "web.Response":
+        """GET /model — return model status, including NVIDIA NIM fallback details."""
+        from agent.model_registry import list_models
+        from agent.quota_registry import load_nvidia_state, get_nvidia_nim_status
+        import time
+
+        try:
+            models = list_models()
+            model_list = []
+            for m in models:
+                model_list.append({
+                    "alias": m.alias,
+                    "provider": m.provider,
+                    "model": m.model,
+                    "display_name": m.display_name,
+                    "family": m.family,
+                    "quota_family": m.quota_family,
+                    "cost_tier": m.cost_tier,
+                    "supports_execute": m.supports_execute,
+                    "execute_enabled": m.execute_enabled,
+                    "role": getattr(m, "role", "primary"),
+                    "priority": getattr(m, "priority", 99),
+                })
+            
+            nv_status = get_nvidia_nim_status()
+            nv_state = load_nvidia_state()
+            
+            cooldown_until = nv_state.get("cooldown_until")
+            if cooldown_until:
+                cooldown_until_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cooldown_until))
+            else:
+                cooldown_until_str = None
+                
+            last_hc = nv_state.get("last_healthcheck_at")
+            if last_hc:
+                last_hc_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_hc))
+            else:
+                last_hc_str = None
+
+            now = time.time()
+            is_cooldown = cooldown_until is not None and now < cooldown_until
+            
+            status_val = nv_state.get("status", "unavailable")
+            if is_cooldown:
+                status_val = "cooldown"
+                
+            execute_enabled_val = nv_state.get("execute_enabled", False)
+            if is_cooldown:
+                execute_enabled_val = False
+
+            nvidia_nim_info = {
+                "provider": "nvidia_nim",
+                "display_name": "NVIDIA NIM Free",
+                "aliases": ["nv-fallback", "nv-kimi", "nv-nemotron"],
+                "default_alias": nv_state.get("default_alias", "nv-fallback"),
+                "default_model": nv_state.get("default_model", "deepseek-ai/deepseek-v4-flash"),
+                "quota": "unknown",
+                "role": "fallback_only",
+                "execute_enabled": execute_enabled_val,
+                "status": status_val,
+                "cooldown_until": cooldown_until_str,
+                "last_error": nv_state.get("last_error"),
+                "last_healthcheck_at": last_hc_str
+            }
+
+            return web.json_response({
+                "models": model_list,
+                "nvidia_nim": nvidia_nim_info
+            })
+        except Exception as e:
+            logger.exception("Failed to handle GET /model")
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -4103,6 +4202,8 @@ class APIServerAdapter(BasePlatformAdapter):
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
+            self._app.router.add_get("/quota", self._handle_quota)
+            self._app.router.add_get("/model", self._handle_model)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)

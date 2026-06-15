@@ -2857,41 +2857,34 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        display_text: Optional[str] = None,
+        current_alias: Optional[str] = None,
     ) -> SendResult:
-        """Send an interactive inline-keyboard model picker.
-
-        Two-step drill-down: provider selection → model selection.
-        Edits the same message in-place as the user navigates.
-        """
+        """Send the registry-backed /model inline keyboard."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
         try:
-            from hermes_cli.providers import get_label
-        except ImportError:
-            def get_label(slug):
-                return slug
-
-        try:
-            # Build provider buttons — folds provider groups (display only).
-            keyboard = self._build_provider_keyboard(providers)
-
-            provider_label = get_label(current_provider)
-            text = self.format_message(
-                (
-                    f"⚙ *Model Configuration*\n\n"
-                    f"Current model: `{current_model or 'unknown'}`\n"
-                    f"Provider: {provider_label}\n\n"
-                    f"Select a provider:"
+            resolved_alias = current_alias or self._resolve_registry_model_alias(current_provider, current_model)
+            keyboard = self._build_registry_model_keyboard(current_alias=resolved_alias)
+            if display_text:
+                text = display_text
+                parse_mode = ParseMode.HTML
+            else:
+                from agent.model_command import render_model_menu_telegram
+                text = render_model_menu_telegram(
+                    current_alias=resolved_alias or current_model,
+                    current_provider=current_provider,
+                    current_model_value=current_model,
                 )
-            )
+                parse_mode = ParseMode.HTML
 
             thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
                 chat_id=int(chat_id),
                 text=text,
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=parse_mode,
                 reply_markup=keyboard,
                 reply_to_message_id=reply_to_id,
                 **self._thread_kwargs_for_send(
@@ -2910,6 +2903,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "providers": providers,
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
+                "current_alias": resolved_alias,
                 "current_model": current_model,
                 "current_provider": current_provider,
             }
@@ -2920,6 +2914,123 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     _MODEL_PAGE_SIZE = 8
+
+    def _registry_family_short_label(self, family: str) -> str:
+        labels = {
+            "volcengine": "Volc",
+            "codex_business": "Biz",
+            "codex_plus": "Plus",
+            "gemini": "Gemini",
+            "claude": "Claude",
+            "gpt": "GPT",
+            "fallback_free": "Free",
+        }
+        return labels.get(family, family[:8])
+
+    def _registry_model_button_label(self, entry, current_alias: Optional[str] = None) -> str:
+        try:
+            from agent.model_command import _short_alias_label
+
+            label = _short_alias_label(entry)
+        except Exception:
+            label = entry.alias
+        prefix = "✓" if entry.alias == current_alias else self._registry_family_short_label(entry.family)
+        if label.lower().startswith(prefix.lower()):
+            text = f"✓ {label}" if entry.alias == current_alias else label
+        else:
+            text = f"{prefix} {label}"
+        return text[:40]
+
+    def _resolve_registry_model_alias(self, provider: str, model: str) -> Optional[str]:
+        try:
+            from agent.model_registry import get_model_by_provider_model, resolve_alias_from_config_model
+            entry = get_model_by_provider_model(provider or "", model or "")
+            if entry:
+                return entry.alias
+            return resolve_alias_from_config_model(provider or "", model or "")
+        except Exception:
+            return None
+
+    def _build_registry_model_keyboard(self, current_alias: Optional[str] = None):
+        """Build compact quota/health-ranked alias buttons."""
+        # @routing-fix: [Telegram] Fix checkmark display and implement registry-backed inline keyboard picker for auto-routing mode.
+        from agent.model_command import model_picker_aliases
+        from agent.model_registry import get_model_by_alias
+
+        rows: list = []
+        auto_label = "✓ 自动模式" if current_alias == "auto" else "自动模式"
+        rows.append([InlineKeyboardButton(auto_label, callback_data="model:select:auto")])
+        buttons = []
+        for alias in model_picker_aliases(current_alias=current_alias):
+            entry = get_model_by_alias(alias)
+            if entry is None:
+                continue
+            label = self._registry_model_button_label(entry, current_alias=current_alias)
+            buttons.append(InlineKeyboardButton(label, callback_data=f"model:select:{entry.alias}"))
+        rows.extend(buttons[i : i + 2] for i in range(0, len(buttons), 2))
+
+        rows.append([
+            InlineKeyboardButton("当前", callback_data="model:current"),
+            InlineKeyboardButton("刷新", callback_data="model:refresh"),
+        ])
+        rows.append([InlineKeyboardButton("取消", callback_data="mx")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _handle_registry_model_callback(self, query, data: str, chat_id: str) -> None:
+        state = self._model_picker_state.get(chat_id)
+        if not state:
+            await query.answer(text="Model menu expired. Use /model again.")
+            return
+
+        from agent.model_command import render_current_model_telegram, switch_model
+
+        current_alias = state.get("current_alias")
+        current_provider = state.get("current_provider")
+        current_model = state.get("current_model")
+
+        if data == "model:refresh":
+            await query.answer(text="正在刷新额度...")
+            from agent.model_command import render_model_menu_telegram
+            text = render_model_menu_telegram(
+                current_alias=current_alias or current_model,
+                current_provider=current_provider,
+                current_model_value=current_model,
+                refresh=True,
+            )
+            keyboard = self._build_registry_model_keyboard(current_alias=current_alias)
+            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return
+
+        if data == "model:current":
+            await query.answer()
+            text = render_current_model_telegram(
+                current_alias=current_alias or current_model,
+                current_provider=current_provider,
+                current_model_value=current_model,
+                refresh=False,
+            )
+            keyboard = self._build_registry_model_keyboard(current_alias=current_alias)
+            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return
+
+        if data.startswith("model:select:"):
+            alias = data.split(":", 2)[2].strip()
+            await query.answer(text=f"正在切换模型: {alias}")
+            result = switch_model(alias, global_flag=False, current_alias=current_alias)
+            callback = state.get("on_model_selected")
+            if callback and result.get("new_alias"):
+                await callback(chat_id, result["new_alias"], result)
+            if result.get("new_alias"):
+                state["current_alias"] = result["new_alias"]
+            await query.edit_message_text(
+                text=result.get("text", "Model selected."),
+                parse_mode=None,
+                reply_markup=None,
+            )
+            self._model_picker_state.pop(chat_id, None)
+            return
+
+        await query.answer(text="Unknown model action.")
 
     def _build_provider_keyboard(self, providers: list):
         """Build the top-level provider keyboard, folding provider groups.
@@ -2947,23 +3058,27 @@ class TelegramAdapter(BasePlatformAdapter):
 
         buttons: list = []
         if group_providers is not None:
-            for row in group_providers([p.get("slug") for p in providers]):
-                if row["kind"] == "group":
-                    members = [by_slug[m] for m in row["members"] if m in by_slug]
-                    count = sum(
-                        m.get("total_models", len(m.get("models", []))) for m in members
-                    )
-                    label = f"{row['label']} ▸ ({count})"
-                    if any(m.get("is_current") for m in members):
-                        label = f"✓ {label}"
-                    buttons.append(
-                        InlineKeyboardButton(label, callback_data=f"mpg:{row['group_id']}")
-                    )
-                else:
-                    p = by_slug.get(row["slug"])
-                    if p is not None:
-                        buttons.append(_provider_button(p))
-        else:
+            try:
+                for row in group_providers([p.get("slug") for p in providers]):
+                    if row["kind"] == "group":
+                        members = [by_slug[m] for m in row["members"] if m in by_slug]
+                        count = sum(
+                            m.get("total_models", len(m.get("models", []))) for m in members
+                        )
+                        label = f"{row['label']} ▸ ({count})"
+                        if any(m.get("is_current") for m in members):
+                            label = f"✓ {label}"
+                        buttons.append(
+                            InlineKeyboardButton(label, callback_data=f"mpg:{row['group_id']}")
+                        )
+                    else:
+                        p = by_slug.get(row["slug"])
+                        if p is not None:
+                            buttons.append(_provider_button(p))
+            except Exception:
+                buttons = []
+        # Fallback: direct button list (no grouping)
+        if not buttons:
             for p in providers:
                 buttons.append(_provider_button(p))
 
@@ -3015,219 +3130,24 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
-        if not state:
-            await query.answer(text="Picker expired — use /model again.")
-            return
-
-        try:
-            from hermes_cli.providers import get_label
-        except ImportError:
-            def get_label(slug):
-                return slug
-
-        if data.startswith("mp:"):
-            # --- Provider selected: show model buttons (page 0) ---
-            provider_slug = data[3:]
-            provider = next(
-                (p for p in state["providers"] if p["slug"] == provider_slug),
-                None,
-            )
-            if not provider:
-                await query.answer(text="Provider not found.")
-                return
-
-            models = provider.get("models", [])
-            state["selected_provider"] = provider_slug
-            state["selected_provider_name"] = provider.get("name", provider_slug)
-            state["model_list"] = models
-            state["model_page"] = 0
-
-            keyboard, page_info = self._build_model_keyboard(models, 0)
-
-            pname = provider.get("name", provider_slug)
-            total = provider.get("total_models", len(models))
-            shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
-
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Provider: *{pname}*{page_info}\n"
-                        f"Select a model:{extra}"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
-            await query.answer()
-
-        elif data.startswith("mg:"):
-            # --- Page navigation ---
-            try:
-                page = int(data[3:])
-            except ValueError:
-                await query.answer(text="Invalid page.")
-                return
-
-            models = state.get("model_list", [])
-            state["model_page"] = page
-
-            keyboard, page_info = self._build_model_keyboard(models, page)
-
-            pname = state.get("selected_provider_name", "")
-            provider_slug = state.get("selected_provider", "")
-            provider = next(
-                (p for p in state["providers"] if p["slug"] == provider_slug),
-                None,
-            )
-            total = provider.get("total_models", len(models)) if provider else len(models)
-            shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
-
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Provider: *{pname}*{page_info}\n"
-                        f"Select a model:{extra}"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
-            await query.answer()
-
-        elif data.startswith("mm:"):
-            # --- Model selected: perform the switch ---
-            try:
-                idx = int(data[3:])
-            except ValueError:
-                await query.answer(text="Invalid selection.")
-                return
-
-            model_list = state.get("model_list", [])
-            if idx < 0 or idx >= len(model_list):
-                await query.answer(text="Invalid model index.")
-                return
-
-            model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
-            callback = state.get("on_model_selected")
-
-            if not callback:
-                await query.answer(text="Picker expired.")
-                return
-
-            try:
-                result_text = await callback(chat_id, model_id, provider_slug)
-            except Exception as exc:
-                logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
-
-            # Edit message to show confirmation, remove buttons
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                # Markdown parse failure — retry as plain text
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(text="Model switched!")
-
-            # Clean up state
+        """Retire pre-registry picker callbacks (mp:/mm:/mb:/mx:/mg:)."""
+        self._model_picker_state.pop(chat_id, None)
+        if data == "mx":
             self._model_picker_state.pop(chat_id, None)
-
-        elif data.startswith("mpg:"):
-            # --- Provider group selected: show member providers ---
-            group_id = data[4:]
-            try:
-                from hermes_cli.models import PROVIDER_GROUPS
-                _label, _desc, member_slugs = PROVIDER_GROUPS.get(group_id, ("", "", []))
-            except Exception:
-                _label, member_slugs = "", []
-
-            by_slug = {p["slug"]: p for p in state["providers"]}
-            members = [by_slug[m] for m in member_slugs if m in by_slug]
-            if not members:
-                await query.answer(text="Group not found.")
-                return
-
-            buttons = []
-            for p in members:
-                count = p.get("total_models", len(p.get("models", [])))
-                label = f"{p['name']} ({count})"
-                if p.get("is_current"):
-                    label = f"✓ {label}"
-                buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
-                )
-            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([
-                InlineKeyboardButton("◀ Back", callback_data="mb"),
-                InlineKeyboardButton("✗ Cancel", callback_data="mx"),
-            ])
-            keyboard = InlineKeyboardMarkup(rows)
-
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Provider family: *{_label or group_id}*\n\n"
-                        f"Select a provider:"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
             await query.answer()
-
-        elif data == "mb":
-            # --- Back to provider list (folds groups) ---
-            keyboard = self._build_provider_keyboard(state["providers"])
-
-            try:
-                provider_label = get_label(state["current_provider"])
-            except Exception:
-                provider_label = state["current_provider"]
-
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Current model: `{state['current_model'] or 'unknown'}`\n"
-                        f"Provider: {provider_label}\n\n"
-                        f"Select a provider:"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
-            await query.answer()
-
-        elif data == "mx":
-            # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,
             )
-            await query.answer()
-
         else:
-            # Catch-all (e.g. page counter button "mx:noop")
-            await query.answer()
+            await query.answer(text="Use /model to open the current menu.")
+            try:
+                await query.edit_message_text(
+                    text="Model menu changed. Use /model to open the current menu.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
@@ -3244,7 +3164,14 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
-        # --- Model picker callbacks ---
+        # --- Registry-backed /model callbacks ---
+        if data.startswith("model:"):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_registry_model_callback(query, data, chat_id)
+            return
+
+        # --- Legacy model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:

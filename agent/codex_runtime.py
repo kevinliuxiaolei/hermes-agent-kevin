@@ -59,6 +59,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            codex_home=getattr(agent, "codex_home", None),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the

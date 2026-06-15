@@ -229,6 +229,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "antigravity-acp": ProviderConfig(
+        id="antigravity-acp",
+        name="Antigravity CLI (via ACP)",
+        auth_type="external_process",
+        inference_base_url="acp://antigravity",
+        base_url_env_var="HERMES_ANTIGRAVITY_ACP_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -357,6 +364,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "nvidia": ProviderConfig(
         id="nvidia",
         name="NVIDIA NIM",
+        auth_type="api_key",
+        inference_base_url="https://integrate.api.nvidia.com/v1",
+        api_key_env_vars=("NVIDIA_API_KEY",),
+        base_url_env_var="NVIDIA_BASE_URL",
+    ),
+    "nvidia_nim": ProviderConfig(
+        id="nvidia_nim",
+        name="NVIDIA NIM Free",
         auth_type="api_key",
         inference_base_url="https://integrate.api.nvidia.com/v1",
         api_key_env_vars=("NVIDIA_API_KEY",),
@@ -5715,6 +5730,9 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
+    if provider_id == "antigravity-acp":
+        return _get_antigravity_acp_auth_status()
+
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -5739,11 +5757,38 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _get_antigravity_acp_auth_status() -> Dict[str, Any]:
+    """Return auth status for the Antigravity CLI (agy) ACP bridge.
+
+    The bridge is considered logged-in when HERMES_ANTIGRAVITY_ACP_COMMAND
+    points to an existing file (the agy_acp_bridge.py script), or when
+    HERMES_ANTIGRAVITY_CLI points to the agy binary.
+    """
+    command = os.getenv("HERMES_ANTIGRAVITY_ACP_COMMAND", "").strip()
+    cli = os.getenv("HERMES_ANTIGRAVITY_CLI", "").strip()
+    resolved_cmd = None
+    if command and os.path.isfile(command):
+        resolved_cmd = command
+    elif cli and (os.path.isfile(cli) or shutil.which(cli)):
+        resolved_cmd = cli
+    logged_in = bool(resolved_cmd)
+    return {
+        "configured": logged_in,
+        "logged_in": logged_in,
+        "provider": "antigravity-acp",
+        "name": "Antigravity CLI (via ACP)",
+        "command": command or cli,
+        "resolved_command": resolved_cmd,
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
-    target = (provider_id or get_active_provider() or "").strip().lower()
-    if not target:
+    raw_target = (provider_id or get_active_provider() or "").strip().lower()
+    if not raw_target:
         return {"logged_in": False}
+    from hermes_cli.models import normalize_provider
+    target = normalize_provider(raw_target)
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":
@@ -5759,6 +5804,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
+        return get_external_process_provider_status(target)
+    if target == "antigravity-acp":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -5912,29 +5959,51 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
-        raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
-            provider=provider_id,
-            code="missing_copilot_cli",
+    if provider_id == "antigravity-acp":
+        command = os.getenv("HERMES_ANTIGRAVITY_ACP_COMMAND", "").strip()
+        cli = os.getenv("HERMES_ANTIGRAVITY_CLI", "").strip()
+        resolved_command = None
+        if command and os.path.isfile(command):
+            resolved_command = command
+        elif cli and (os.path.isfile(cli) or shutil.which(cli)):
+            resolved_command = cli
+
+        if not resolved_command and not base_url.startswith("acp+tcp://"):
+            raise AuthError(
+                "Could not resolve path for Antigravity bridge script or CLI binary. "
+                "Ensure HERMES_ANTIGRAVITY_ACP_COMMAND or HERMES_ANTIGRAVITY_CLI is set.",
+                provider=provider_id,
+                code="missing_antigravity_cli",
+            )
+        api_key = "no-key-required"
+        args = []
+        source_val = "external_process"
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
         )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command and not base_url.startswith("acp+tcp://"):
+            raise AuthError(
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+                provider=provider_id,
+                code="missing_copilot_cli",
+            )
+        api_key = "copilot-acp"
+        source_val = "process"
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
-        "source": "process",
+        "source": source_val,
     }
 
 
@@ -6313,6 +6382,8 @@ def _login_openai_codex(
                     reuse = "y"
                 if reuse in {"", "y", "yes"}:
                     config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
+                    from agent.route_health import clear_route_health
+                    clear_route_health("openai-codex")
                     print()
                     print("Login successful!")
                     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
@@ -6336,6 +6407,8 @@ def _login_openai_codex(
                 _save_codex_tokens(cli_tokens)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
+                from agent.route_health import clear_route_health
+                clear_route_health("openai-codex")
                 print()
                 print("Credentials imported. Note: if Codex CLI refreshes its token,")
                 print("Hermes will keep working independently with its own session.")
@@ -6353,6 +6426,8 @@ def _login_openai_codex(
     # Save tokens to Hermes auth store
     _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
+    from agent.route_health import clear_route_health
+    clear_route_health("openai-codex")
     print()
     print("Login successful!")
     from hermes_constants import display_hermes_home as _dhh

@@ -408,6 +408,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        **kwargs,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -480,6 +481,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            **kwargs,
         )
 
     def _get_session_db_for_recall(self):
@@ -2684,6 +2686,17 @@ class AIAgent:
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
+        _desc = (desc or "").lower()
+        if "compress" in _desc or "summary" in _desc:
+            self._activity_phase = "compression"
+        elif "fallback" in _desc or "switching" in _desc:
+            self._activity_phase = "fallback"
+        elif "executing tool" in _desc:
+            self._activity_phase = "tool"
+        elif "waiting for" in _desc or "starting api call" in _desc:
+            self._activity_phase = "model_wait"
+        elif "receiving stream" in _desc or "api call" in _desc:
+            self._activity_phase = "model_wait"
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -2869,8 +2882,13 @@ class AIAgent:
         return {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
+            "phase": getattr(self, "_activity_phase", "routing"),
             "seconds_since_activity": round(elapsed, 1),
             "current_tool": self._current_tool,
+            "provider": getattr(self, "provider", None),
+            "model": getattr(self, "model", None),
+            "route_attempt": max(1, int(getattr(self, "_fallback_index", -1)) + 2),
+            "route_total": 1 + len(getattr(self, "_fallback_chain", []) or []),
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
@@ -3985,6 +4003,23 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        # Handle end-of-stream (None) to flush scrubbers and emit any buffered content.
+        if text is None:
+            # Flush think scrubber
+            think_scrubber = getattr(self, "_stream_think_scrubber", None)
+            if think_scrubber is not None:
+                flushed = think_scrubber.flush()
+                if flushed:
+                    text = flushed
+            # Flush context scrubber
+            scrubber = getattr(self, "_stream_context_scrubber", None)
+            if scrubber is not None:
+                flushed_ctx = scrubber.flush()
+                if flushed_ctx:
+                    text = (text or "") + flushed_ctx
+            # If nothing to emit, exit early
+            if not text:
+                return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking

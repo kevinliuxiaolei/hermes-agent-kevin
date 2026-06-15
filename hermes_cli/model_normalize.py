@@ -86,6 +86,8 @@ _STRIP_VENDOR_ONLY_PROVIDERS: frozenset[str] = frozenset({
 _AUTHORITATIVE_NATIVE_PROVIDERS: frozenset[str] = frozenset({
     "gemini",
     "huggingface",
+    "antigravity-acp",
+    "nvidia_nim",
 })
 
 # Direct providers that accept bare native names but should repair a matching

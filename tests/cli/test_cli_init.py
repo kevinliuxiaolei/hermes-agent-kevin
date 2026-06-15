@@ -110,10 +110,11 @@ class TestFallbackChainInit:
             ],
             "fallback_model": {"provider": "nous", "model": "Hermes-4"},
         })
-        assert cli._fallback_model == [
+        assert cli._fallback_model[:2] == [
             {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
             {"provider": "nous", "model": "Hermes-4"},
         ]
+        assert len(cli._fallback_model) == 4
 
 
 class TestBusyInputMode:

@@ -327,6 +327,8 @@ def compress_context(
     agent._emit_status(
         "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
     )
+    if hasattr(agent, "_touch_activity"):
+        agent._touch_activity("compressing conversation context")
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -489,6 +491,8 @@ def compress_context(
                     f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
                     "check auxiliary.compression.model in config.yaml."
                 )
+    if hasattr(agent, "_touch_activity"):
+        agent._touch_activity("context compression completed")
 
     todo_snapshot = agent._todo_store.format_for_injection()
     if todo_snapshot:

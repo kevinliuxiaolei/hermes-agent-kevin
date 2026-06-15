@@ -74,6 +74,16 @@ _DEFAULT_PROVIDER_MODELS = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    "antigravity-acp": [
+        "models/gemini-flash-latest",
+        "models/gemini-flash-lite-latest",
+        "3.5-flash(high)",
+        "3.5-flash(medium)",
+        "3.5-flash(low)",
+        "3.1-pro(high)",
+        "3.1-pro(low)",
+        "3-flash",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",

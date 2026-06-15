@@ -54,7 +54,6 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
-from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -1188,8 +1187,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
     is authoritative.
 
     If the primary provider fails with an authentication error, attempt to
-    resolve credentials using the fallback provider chain from config.yaml
-    before giving up.
+    resolve credentials using configured fallback entries first, then the
+    registry fallback chain before giving up.
     """
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -1249,18 +1248,35 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
 
 def _try_resolve_fallback_provider() -> dict | None:
-    """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
+    """Attempt to resolve credentials from the configured or registry fallback chain."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
+        import inspect
         import yaml as _y
+        from agent.route_plan import build_route_plan
         cfg_path = _hermes_home / "config.yaml"
+        cfg = {}
         if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
-        fb_list = get_fallback_chain(cfg)
+            selected_alias = None
+        else:
+            with open(cfg_path, encoding="utf-8") as _f:
+                cfg = _y.safe_load(_f) or {}
+            selected_alias = ((cfg.get("model_selection") or {}).get("selected_model_alias") or None)
+
+        model_cfg = cfg.get("model") or {}
+        plan = build_route_plan(
+            task="chat",
+            preferred_alias=selected_alias,
+            current_provider=model_cfg.get("provider"),
+            current_model=model_cfg.get("model") or model_cfg.get("default"),
+            current_base_url=model_cfg.get("base_url"),
+            config=cfg,
+        )
+        fb_list = plan.legacy_fallback_model()
         if not fb_list:
             return None
+        runtime_sig = inspect.signature(resolve_runtime_provider)
+        supports_target_model = "target_model" in runtime_sig.parameters
         for entry in fb_list:
             try:
                 explicit_api_key = entry.get("api_key")
@@ -1270,11 +1286,31 @@ def _try_resolve_fallback_provider() -> dict | None:
                     ).strip()
                     if key_env:
                         explicit_api_key = os.getenv(key_env, "").strip() or None
-                runtime = resolve_runtime_provider(
-                    requested=entry.get("provider"),
-                    explicit_base_url=entry.get("base_url"),
-                    explicit_api_key=explicit_api_key,
-                )
+                codex_home = entry.get("codex_home")
+                old_codex_home = os.environ.get("CODEX_HOME")
+                old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+                if codex_home:
+                    os.environ["CODEX_HOME"] = codex_home
+                    os.environ["HERMES_CODEX_HOME"] = codex_home
+                try:
+                    resolve_kwargs = {
+                        "requested": entry.get("provider"),
+                        "explicit_base_url": entry.get("base_url"),
+                        "explicit_api_key": explicit_api_key,
+                    }
+                    if supports_target_model:
+                        resolve_kwargs["target_model"] = entry.get("model")
+                    runtime = resolve_runtime_provider(**resolve_kwargs)
+                finally:
+                    if codex_home:
+                        if old_codex_home is None:
+                            os.environ.pop("CODEX_HOME", None)
+                        else:
+                            os.environ["CODEX_HOME"] = old_codex_home
+                        if old_hermes_codex_home is None:
+                            os.environ.pop("HERMES_CODEX_HOME", None)
+                        else:
+                            os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
                 # Log the literal `provider` key from config, not the resolved
                 # runtime category — an Ollama fallback resolves through the
                 # OpenAI-compatible path and would otherwise be logged as
@@ -1293,6 +1329,8 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    "codex_home": entry.get("codex_home"),
+                    "_fallback_model": fb_list,
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -1599,11 +1637,21 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     openai-codex.
     """
     cfg = config if config is not None else _load_gateway_config()
+    try:
+        from agent.model_selector import get_selected_alias_from_config
+        from agent.model_registry import get_model_by_alias
+        selected_alias = get_selected_alias_from_config(cfg)
+        if selected_alias:
+            entry = get_model_by_alias(selected_alias)
+            if entry:
+                return entry.model
+    except Exception:
+        pass
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg
     elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
+        return model_cfg.get("model") or model_cfg.get("default") or ""
     return ""
 
 
@@ -2604,12 +2652,111 @@ class GatewayRunner:
                 return None
         return None
 
+    @staticmethod
+    def _model_selector_task(
+        *,
+        session_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> str:
+        marker = " ".join(str(v or "") for v in (session_id, task_id)).lower()
+        if "cron_" in marker or marker.startswith("cron"):
+            return "cron"
+        text = str(message or "").lower()
+        if any(word in text for word in ("review", "审查", "code", "代码", "refactor", "重构")):
+            return "analysis"
+        return "chat"
+
+    @staticmethod
+    def _run_with_codex_home(codex_home: Optional[str], fn):
+        if not codex_home:
+            return fn()
+        old_codex_home = os.environ.get("CODEX_HOME")
+        old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+        os.environ["CODEX_HOME"] = codex_home
+        os.environ["HERMES_CODEX_HOME"] = codex_home
+        try:
+            return fn()
+        finally:
+            if old_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = old_codex_home
+            if old_hermes_codex_home is None:
+                os.environ.pop("HERMES_CODEX_HOME", None)
+            else:
+                os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
+
+    def _resolve_runtime_for_model_entry(self, entry, fallback_runtime: dict) -> dict:
+        """Resolve runtime for a registry entry without carrying stale provider fields."""
+        resolved_runtime = False
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            def _resolve():
+                return resolve_runtime_provider(
+                    requested=entry.provider,
+                    target_model=entry.model,
+                )
+
+            runtime = self._run_with_codex_home(entry.codex_home, _resolve)
+            runtime = dict(runtime or {})
+            resolved_runtime = bool(runtime)
+        except Exception as exc:
+            logger.debug(
+                "registry runtime resolution failed for %s/%s: %s",
+                entry.provider,
+                entry.model,
+                exc,
+            )
+            runtime = {}
+
+        if not runtime:
+            runtime = {
+                key: value
+                for key, value in (fallback_runtime or {}).items()
+                if key in {"api_key", "base_url", "max_tokens"}
+            }
+
+        runtime["provider"] = entry.provider
+        if not resolved_runtime and entry.provider != (fallback_runtime or {}).get("provider"):
+            for key in ("base_url", "api_key", "api_mode", "command", "args", "credential_pool"):
+                runtime.pop(key, None)
+        if entry.codex_home:
+            runtime["codex_home"] = entry.codex_home
+        else:
+            runtime.pop("codex_home", None)
+        return runtime
+
+    def _build_registry_fallback_model(
+        self,
+        *,
+        task: str,
+        preferred_alias: Optional[str],
+        current_provider: Optional[str] = None,
+        current_model: Optional[str] = None,
+        current_codex_home: Optional[str] = None,
+        user_config: Optional[dict] = None,
+    ) -> list:
+        from agent.route_plan import build_route_plan
+
+        plan = build_route_plan(
+            task=task or "chat",
+            preferred_alias=preferred_alias,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_codex_home=current_codex_home,
+            config=user_config,
+        )
+        return plan.legacy_fallback_model()
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        task: str = "chat",
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -2626,7 +2773,9 @@ class GatewayRunner:
 
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        selected_alias = None
         if override:
+            selected_alias = override.get("selected_model_alias") or None
             override_model = override.get("model", model)
             override_runtime = {
                 "provider": override.get("provider"),
@@ -2636,6 +2785,14 @@ class GatewayRunner:
                 "max_tokens": override.get("max_tokens"),
             }
             if override_runtime.get("api_key"):
+                override_runtime["_fallback_model"] = self._build_registry_fallback_model(
+                    task=task or "chat",
+                    preferred_alias=selected_alias,
+                    current_provider=override_runtime.get("provider"),
+                    current_model=override_model,
+                    current_codex_home=override.get("codex_home"),
+                    user_config=user_config,
+                )
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     resolved_session_key or "", model, override_model,
@@ -2654,20 +2811,109 @@ class GatewayRunner:
                 resolved_session_key or "", model,
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
+        if not selected_alias:
+            ms = (user_config or {}).get("model_selection") or {}
+            selected_alias = ms.get("selected_model_alias") or None
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
-            logger.info(
-                "Runtime provider supplied explicit model override: %s -> %s",
-                model,
-                runtime_model,
-            )
-            model = runtime_model
-        if override and resolved_session_key:
+        runtime_kwargs: dict = {}
+        if selected_alias:
+            try:
+                from agent.model_registry import get_model_by_alias
+                from agent.model_selector import select_model_with_reason
+
+                preferred_entry = get_model_by_alias(selected_alias)
+                selection = select_model_with_reason(
+                    task=task or "chat",
+                    preferred_alias=selected_alias,
+                    refresh_quota=False,
+                )
+                selected_entry = selection.entry
+                if selected_entry:
+                    model = selected_entry.model
+                    runtime_kwargs = self._resolve_runtime_for_model_entry(
+                        selected_entry,
+                        runtime_kwargs,
+                    )
+                    runtime_kwargs["_fallback_model"] = self._build_registry_fallback_model(
+                        task=task or "chat",
+                        preferred_alias=selected_alias,
+                        current_provider=selected_entry.provider,
+                        current_model=selected_entry.model,
+                        current_codex_home=selected_entry.codex_home,
+                        user_config=user_config,
+                    )
+                    logger.info(
+                        "model_selector selected alias=%s actual=%s provider=%s reason=%s skipped=%s",
+                        selected_alias,
+                        selected_entry.alias,
+                        selected_entry.provider,
+                        selection.reason,
+                        selection.skipped[:3],
+                    )
+                elif preferred_entry:
+                    runtime_kwargs["_fallback_model"] = self._build_registry_fallback_model(
+                        task=task or "chat",
+                        preferred_alias=selected_alias,
+                        current_provider=preferred_entry.provider,
+                        current_model=preferred_entry.model,
+                        current_codex_home=preferred_entry.codex_home,
+                        user_config=user_config,
+                    )
+                    if not runtime_kwargs["_fallback_model"]:
+                        logger.warning(
+                            "No executable model available for selected alias %s",
+                            selected_alias,
+                        )
+                        logger.debug(
+                            "Selector skipped candidates for %s: %s",
+                            selected_alias,
+                            selection.skipped[:8],
+                        )
+                        raise RuntimeError(
+                            f"No executable model available for selected alias {selected_alias}; "
+                            "all registry fallback candidates are unavailable"
+                        )
+                else:
+                    logger.warning("Unknown selected_model_alias %s; falling back to config runtime", selected_alias)
+                    selected_alias = None
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                logger.warning("model_selector resolution failed: %s", exc)
+                selected_alias = None
+
+        if not selected_alias:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_model = runtime_kwargs.pop("model", None)
+            if runtime_model:
+                logger.info(
+                    "Runtime provider supplied explicit model override: %s -> %s",
+                    model,
+                    runtime_model,
+                )
+                model = runtime_model
+
+        if not selected_alias and override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+        if "_fallback_model" not in runtime_kwargs:
+            try:
+                from agent.model_registry import resolve_alias_from_config_model
+                current_alias = resolve_alias_from_config_model(
+                    runtime_kwargs.get("provider") or "",
+                    model or "",
+                )
+                runtime_kwargs["_fallback_model"] = self._build_registry_fallback_model(
+                    task=task or "chat",
+                    preferred_alias=current_alias,
+                    current_provider=runtime_kwargs.get("provider"),
+                    current_model=model,
+                    current_codex_home=runtime_kwargs.get("codex_home"),
+                    user_config=user_config,
+                )
+            except Exception as exc:
+                logger.debug("registry fallback build failed: %s", exc)
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -2732,10 +2978,12 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
+            "codex_home": runtime_kwargs.get("codex_home"),
         }
         route = {
             "model": model,
             "runtime": runtime,
+            "fallback_model": runtime_kwargs.get("_fallback_model"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -2743,6 +2991,7 @@ class GatewayRunner:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime["codex_home"],
             ),
         }
 
@@ -3319,21 +3568,10 @@ class GatewayRunner:
 
     @staticmethod
     def _load_fallback_model() -> list | None:
-        """Load fallback provider chain from config.yaml.
-
-        Returns the merged effective chain from ``fallback_providers`` plus any
-        legacy ``fallback_model`` entries. ``fallback_providers`` stays first
-        when both keys are present.
-        """
+        """Load startup fallback chain from Model Registry, not config fallback_providers."""
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
+            from agent.route_plan import build_route_plan
+            return build_route_plan(task="chat").legacy_fallback_model() or None
         except Exception:
             pass
         return None
@@ -3442,6 +3680,12 @@ class GatewayRunner:
         running_agent = self._running_agents.get(session_key)
 
         effective_mode = self._busy_input_mode
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and event.message_type == MessageType.TEXT
+            and effective_mode == "interrupt"
+        ):
+            effective_mode = "queue"
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
         if (
             event.message_type == MessageType.TEXT
@@ -4763,22 +5007,7 @@ class GatewayRunner:
         if connected_count > 0:
             await asyncio.sleep(1.0)
 
-        # Notify the chat that initiated /restart that the gateway is back.
-        planned_restart_notification_pending = _planned_restart_notification_pending()
-        await self._send_restart_notification()
-
-        # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
-            try:
-                await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
-                )
-            finally:
-                _clear_planned_restart_notification()
+        await self._send_startup_lifecycle_notifications()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -7873,6 +8102,9 @@ class GatewayRunner:
 
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
+                _model_args = (event.get_command_args() or "").strip().lower()
+                if _model_args in {"", "list", "list all", "all", "current", "preview", "inspect", "dump"}:
+                    return await self._handle_model_command(event, read_only=True)
                 return "Agent is running — wait or /stop first, then switch models."
 
             # /codex-runtime must not be used while the agent is running.
@@ -8067,6 +8299,10 @@ class GatewayRunner:
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
+            if source.platform == Platform.TELEGRAM and event.message_type == MessageType.TEXT:
+                logger.debug("PRIORITY Telegram follow-up queued for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
@@ -9042,7 +9278,8 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            _sk = self._session_key_for_source(source)
+                            session_info = self._format_session_info(session_key=_sk)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -9290,8 +9527,10 @@ class GatewayRunner:
                             ]
 
                             if len(_hyg_msgs) >= 4:
+                                _hyg_agent_runtime = dict(_hyg_runtime)
+                                _hyg_codex_home = _hyg_agent_runtime.pop("codex_home", None)
                                 _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
+                                    **_hyg_agent_runtime,
                                     model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
@@ -9299,6 +9538,7 @@ class GatewayRunner:
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                 )
+                                _hyg_agent.codex_home = _hyg_codex_home
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
@@ -9583,6 +9823,19 @@ class GatewayRunner:
             )
             response = _sanitize_gateway_final_response(source.platform, response)
 
+            # Telegram fallback alerts for NVIDIA NIM Free v2 / Google AI Studio fallback
+            if getattr(source, "platform", None) == Platform.TELEGRAM:
+                error_str = str(agent_result.get("error") or "")
+                response_str = str(response or "")
+                if "No executable model available" in error_str or "No executable model available" in response_str:
+                    response = "当前主模型和 NVIDIA/Google AI Studio 免费兜底模型均不可用。请检查额度、认证或稍后重试。"
+                elif agent_result.get("provider") == "nvidia_nim":
+                    if not response.startswith("当前主模型"):
+                        response = "主模型不可用，已切换到 NVIDIA 免费兜底模型，结果仅作轻量参考。\n\n" + response
+                elif agent_result.get("provider") == "gemini":
+                    if not response.startswith("当前主模型"):
+                        response = "主模型不可用，已切换到 Google AI Studio 免费兜底模型，结果仅作轻量参考。\n\n" + response
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -9622,10 +9875,47 @@ class GatewayRunner:
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                from agent.model_registry import resolve_alias_from_config_model
+                from agent.model_selector import get_selected_alias_from_config
+
+                _footer_cfg = _load_gateway_config()
+                _requested_alias = None
+                try:
+                    _override = self._session_model_overrides.get(session_key, {}) if session_key else {}
+                    _requested_alias = _override.get("selected_model_alias") or None
+                except Exception:
+                    _requested_alias = None
+                if not _requested_alias:
+                    try:
+                        _requested_alias = get_selected_alias_from_config(_footer_cfg)
+                    except Exception:
+                        _requested_alias = None
+
+                _executed_alias = None
+                try:
+                    _executed_alias = resolve_alias_from_config_model(
+                        str(agent_result.get("provider") or ""),
+                        str(agent_result.get("model") or ""),
+                    ) or None
+                except Exception:
+                    _executed_alias = None
+                _executed_slot = None
+                if str(agent_result.get("provider") or "") == "antigravity-acp":
+                    try:
+                        from agent.agy_slot_state import get_last_executed_slot
+                        _executed_slot = get_last_executed_slot(max_age_seconds=3600)
+                    except Exception:
+                        _executed_slot = None
+
                 _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
+                    user_config=_footer_cfg,
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
+                    requested_alias=_requested_alias,
+                    requested_model=_resolve_gateway_model(_footer_cfg),
+                    executed_alias=_executed_alias,
+                    executed_model=agent_result.get("model"),
+                    executed_slot=_executed_slot,
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
@@ -9928,31 +10218,7 @@ class GatewayRunner:
                         status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
                 else:
                     status_hint = " You are being rate-limited. Please wait a moment and try again."
-            elif status_code == 529:
-                status_hint = " The API is temporarily overloaded. Please try again shortly."
-            elif status_code in {400, 500}:
-                # 400 with a large session is context overflow.
-                # 500 with a large session often means the payload is too large
-                # for the API to process — treat it the same way.
-                if _hist_len > 50:
-                    return (
-                        "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
-                        "/reset to start fresh."
-                    )
-                elif status_code == 400:
-                    status_hint = " The request was rejected by the API."
-            return (
-                f"Sorry, I encountered an error ({error_type}).\n"
-                f"{error_detail}\n"
-                f"{status_hint}"
-                "Try again or use /reset to start a fresh session."
-            )
-        finally:
-            # Restore session context variables to their pre-handler state
-            self._clear_session_env(_session_env_tokens)
-
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, session_key: Optional[str] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -9961,11 +10227,7 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
         config_context_length = None
-        provider = None
-        base_url = None
-        api_key = None
         custom_provs = None
         data = None
 
@@ -9980,8 +10242,6 @@ class GatewayRunner:
                             config_context_length = int(raw_ctx)
                         except (TypeError, ValueError):
                             pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(data)
@@ -9993,6 +10253,8 @@ class GatewayRunner:
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:
             try:
+                # We need a model name to check, try resolving it first
+                model_for_config = _resolve_gateway_model()
                 custom_providers = data.get("custom_providers", [])
                 if custom_providers:
                     for cp in custom_providers:
@@ -10001,7 +10263,7 @@ class GatewayRunner:
                         cp_model = cp.get("model") or ""
                         cp_models = cp.get("models") or {}
                         # Match provider model to current model
-                        if cp_model and cp_model == model:
+                        if cp_model and cp_model == model_for_config:
                             raw_cp_ctx = cp.get("context_length")
                             if raw_cp_ctx is not None:
                                 try:
@@ -10011,7 +10273,7 @@ class GatewayRunner:
                                     pass
                         # Also check per-model context_length
                         if isinstance(cp_models, dict):
-                            model_entry = cp_models.get(model)
+                            model_entry = cp_models.get(model_for_config)
                             if isinstance(model_entry, dict):
                                 model_ctx = model_entry.get("context_length")
                             else:
@@ -10025,14 +10287,23 @@ class GatewayRunner:
             except Exception:
                 pass
 
-        # Resolve runtime credentials for probing
+        # Resolve model and credentials (checking session overrides first)
         try:
-            runtime = _resolve_runtime_agent_kwargs()
-            provider = provider or runtime.get("provider")
-            base_url = base_url or runtime.get("base_url")
+            model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
+            provider = runtime.get("provider")
+            base_url = runtime.get("base_url")
             api_key = runtime.get("api_key")
         except Exception:
-            pass
+            model = _resolve_gateway_model()
+            try:
+                runtime = _resolve_runtime_agent_kwargs()
+                provider = runtime.get("provider")
+                base_url = runtime.get("base_url")
+                api_key = runtime.get("api_key")
+            except Exception:
+                provider = None
+                base_url = None
+                api_key = None
 
         context_length = get_model_context_length(
             model,
@@ -10053,7 +10324,10 @@ class GatewayRunner:
 
         # Format context length for display
         if context_length >= 1_000_000:
-            ctx_display = f"{context_length / 1_000_000:.1f}M"
+            if context_length % 1_000_000 == 0:
+                ctx_display = f"{context_length // 1_000_000}M"
+            else:
+                ctx_display = f"{context_length / 1_000_000:.1f}M"
         elif context_length >= 1_000:
             ctx_display = f"{context_length // 1_000}K"
         else:
@@ -10167,7 +10441,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(session_key=session_key)
         except Exception:
             session_info = ""
 
@@ -10501,6 +10775,19 @@ class GatewayRunner:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        running_agent = self._running_agents.get(session_key)
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL and hasattr(running_agent, "get_activity_summary"):
+            try:
+                activity = running_agent.get_activity_summary()
+                lines.extend([
+                    f"Phase: {activity.get('phase', 'unknown')}",
+                    f"Route: {activity.get('provider', 'unknown')} / {activity.get('model', 'unknown')} "
+                    f"({activity.get('route_attempt', 1)}/{activity.get('route_total', 1)})",
+                    f"Last meaningful activity: {activity.get('last_activity_desc', 'unknown')} "
+                    f"({activity.get('seconds_since_activity', 0)}s ago)",
+                ])
+            except Exception:
+                pass
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         lines.extend([
@@ -11025,417 +11312,237 @@ class GatewayRunner:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_model_command(
+        self,
+        event: MessageEvent,
+        *,
+        read_only: bool = False,
+    ) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
+        Uses the new Model Registry + Quota Registry (agent.model_command).
         Supports:
-          /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch for this session only
-          /model <name> --global              — switch and persist to config.yaml
-          /model <name> --provider <provider> — switch provider + model
-          /model --provider <provider>        — switch to provider, auto-detect model
+          /model                       — text menu of all families + quota
+          /model refresh               — force-refresh quota and show menu
+          /model <alias>               — switch for this session only
+          /model <alias> --global      — switch and persist to config.yaml
+
+        The Telegram inline menu is registry-backed; all display and switching
+        logic goes through agent.model_command and Model Registry aliases.
         """
         import yaml
-        from hermes_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags,
-            list_authenticated_providers,
-            list_picker_providers,
-        )
-        from hermes_cli.providers import get_label
+        from agent.model_command import handle_model_command, render_model_list, render_model_menu_telegram
+        from agent.model_registry import get_model_by_alias, resolve_alias_from_config_model
+        from agent.model_selector import get_selected_alias_from_config
 
         raw_args = event.get_command_args().strip()
 
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        config_path = _hermes_home / "config.yaml"
 
-        # --refresh: bust the disk cache so the picker shows live data.
-        if force_refresh:
+        # Resolve current alias from session override or config
+        current_alias = None
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_alias = override.get("selected_model_alias") or None
+        if not current_alias:
             try:
-                from hermes_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
+                cfg = _load_gateway_config() or {}
+                current_alias = get_selected_alias_from_config(cfg)
             except Exception:
                 pass
 
-        # Read current model/provider from config
+        # Resolve the current provider/model strings for /model current.
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
-        user_provs = None
-        custom_provs = None
-        config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
+                    current_model = model_cfg.get("model") or model_cfg.get("default") or ""
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
-                user_provs = cfg.get("providers")
-                try:
-                    from hermes_cli.config import get_compatible_custom_providers
-                    custom_provs = get_compatible_custom_providers(cfg)
-                except Exception:
-                    custom_provs = cfg.get("custom_providers")
+                    current_api_key = model_cfg.get("api_key", "")
         except Exception:
             pass
 
+        if current_alias:
+            entry = get_model_by_alias(current_alias)
+            if entry:
+                current_model = entry.model
+                current_provider = entry.provider
+
         # Check for session override
-        source = event.source
-        session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+            override_alias = override.get("selected_model_alias")
+            if override_alias:
+                entry = get_model_by_alias(override_alias)
+                if entry:
+                    current_model = entry.model
+                    current_provider = entry.provider
 
-        # No args: show interactive picker (Telegram/Discord) or text list
-        if not model_input and not explicit_provider:
-            # Try interactive picker if the platform supports it
-            adapter = self.adapters.get(source.platform)
-            has_picker = (
-                adapter is not None
-                and getattr(type(adapter), "send_model_picker", None) is not None
-            )
-
-            if has_picker:
+        from gateway.config import Platform
+        if (
+            not read_only
+            and event.source.platform == Platform.TELEGRAM
+            and raw_args.lower() in ("", "refresh", "--refresh")
+        ):
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            if adapter:
                 try:
-                    providers = list_picker_providers(
-                        current_provider=current_provider,
-                        current_base_url=current_base_url,
-                        current_model=current_model,
-                        user_providers=user_provs,
-                        custom_providers=custom_provs,
-                        max_models=50,
-                    )
-                except Exception:
-                    providers = []
-
-                if providers:
-                    # Build a callback closure for when the user picks a model.
-                    # Captures self + locals needed for the switch logic.
-                    _self = self
-                    _session_key = session_key
-                    _cur_model = current_model
-                    _cur_provider = current_provider
-                    _cur_base_url = current_base_url
-                    _cur_api_key = current_api_key
-
-                    async def _on_model_selected(
-                        _chat_id: str, model_id: str, provider_slug: str
-                    ) -> str:
-                        """Perform the model switch and return confirmation text."""
-                        result = _switch_model(
-                            raw_input=model_id,
-                            current_provider=_cur_provider,
-                            current_model=_cur_model,
-                            current_base_url=_cur_base_url,
-                            current_api_key=_cur_api_key,
-                            is_global=False,
-                            explicit_provider=provider_slug,
-                            user_providers=user_provs,
-                            custom_providers=custom_provs,
-                        )
-                        if not result.success:
-                            return t("gateway.model.error_prefix", error=result.error_message)
-
-                        # Update cached agent in-place
-                        cached_entry = None
-                        _cache_lock = getattr(_self, "_agent_cache_lock", None)
-                        _cache = getattr(_self, "_agent_cache", None)
-                        if _cache_lock and _cache is not None:
-                            with _cache_lock:
-                                cached_entry = _cache.get(_session_key)
-                        if cached_entry and cached_entry[0] is not None:
+                    async def _on_model_selected(_chat_id, alias, result):
+                        result_payload = result if isinstance(result, dict) else {}
+                        selected_alias = alias
+                        if not result_payload:
                             try:
-                                cached_entry[0].switch_model(
-                                    new_model=result.new_model,
-                                    new_provider=result.target_provider,
-                                    api_key=result.api_key,
-                                    base_url=result.base_url,
-                                    api_mode=result.api_mode,
-                                )
-                            except Exception as exc:
-                                logger.warning("Picker model switch failed for cached agent: %s", exc)
+                                from agent.model_registry import resolve_alias_from_config_model
+                                selected_alias = resolve_alias_from_config_model(str(result), alias) or alias
+                            except Exception:
+                                selected_alias = alias
+                        self._session_model_overrides[session_key] = {
+                            "selected_model_alias": selected_alias,
+                        }
+                        self._evict_cached_agent(session_key)
 
-                        # Persist the new model to the session DB so the
-                        # dashboard shows the updated model (#34850).
-                        _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
-                            try:
-                                _sess_entry = _self.session_store.get_or_create_session(
-                                    event.source
-                                )
-                                _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
-                                )
-
-                        # Store model note + session override
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
-                            f"via {result.provider_label or result.target_provider}. "
+                        if not hasattr(self, "_pending_model_notes"):
+                            self._pending_model_notes = {}
+                        codex_home = result_payload.get("codex_home")
+                        codex_note = f" (CODEX_HOME={codex_home})" if codex_home else ""
+                        self._pending_model_notes[session_key] = (
+                            f"[Note: model preference switched to {selected_alias}{codex_note}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
 
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
-                        _self._evict_cached_agent(_session_key)
+                        _sess_db = getattr(self, "_session_db", None)
+                        if _sess_db is not None:
+                            try:
+                                _sess_entry = self.session_store.get_or_create_session(source)
+                                _sess_db.update_session_model(
+                                    _sess_entry.session_id, selected_alias
+                                )
+                            except Exception as exc:
+                                logger.debug("Failed to persist model switch to DB: %s", exc)
 
-                        # Build confirmation text
-                        plabel = result.provider_label or result.target_provider
-                        lines = [t("gateway.model.switched", model=result.new_model)]
-                        lines.append(t("gateway.model.provider_label", provider=plabel))
-                        mi = result.model_info
-                        from hermes_cli.model_switch import resolve_display_context_length
-                        _sw_config_ctx = None
-                        try:
-                            _sw_cfg = _load_gateway_config()
-                            _sw_model_cfg = _sw_cfg.get("model", {})
-                            if isinstance(_sw_model_cfg, dict):
-                                _sw_raw = _sw_model_cfg.get("context_length")
-                                if _sw_raw is not None:
-                                    _sw_config_ctx = int(_sw_raw)
-                        except Exception:
-                            pass
-                        ctx = resolve_display_context_length(
-                            result.new_model,
-                            result.target_provider,
-                            base_url=result.base_url or current_base_url or "",
-                            api_key=result.api_key or current_api_key or "",
-                            model_info=mi,
-                            custom_providers=custom_provs,
-                            config_context_length=_sw_config_ctx,
-                        )
-                        if ctx:
-                            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
-                        if mi:
-                            if mi.max_output:
-                                lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
-                            if mi.has_cost_data():
-                                lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
-                            lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
-                        lines.append(t("gateway.model.session_only_hint"))
-                        return "\n".join(lines)
+                        return f"Model switched to {selected_alias}{codex_note}"
+
+                    display_text = render_model_menu_telegram(
+                        current_alias=current_alias or current_model,
+                        current_provider=current_provider,
+                        current_model_value=current_model,
+                        refresh=raw_args.lower() in ("refresh", "--refresh"),
+                    )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    result = await adapter.send_model_picker(
+                    picker_res = await adapter.send_model_picker(
                         chat_id=source.chat_id,
-                        providers=providers,
+                        providers=[],
                         current_model=current_model,
                         current_provider=current_provider,
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
+                        display_text=display_text,
+                        current_alias=current_alias,
                     )
-                    if result.success:
-                        return None  # Picker sent — adapter handles the response
+                    if picker_res.success:
+                        return None
+                except Exception as exc:
+                    logger.warning("Failed to send model picker: %s", exc)
 
-            # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
-
-            try:
-                providers = list_authenticated_providers(
-                    current_provider=current_provider,
-                    current_base_url=current_base_url,
-                    current_model=current_model,
-                    user_providers=user_provs,
-                    custom_providers=custom_provs,
-                    max_models=5,
-                )
-                for p in providers:
-                    tag = t("gateway.model.current_tag") if p["is_current"] else ""
-                    lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
-                    if p["models"]:
-                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
-                        extra = t("gateway.model.more_models_suffix", count=p["total_models"] - len(p["models"])) if p["total_models"] > len(p["models"]) else ""
-                        lines.append(f"  {model_strs}{extra}")
-                    elif p.get("api_url"):
-                        lines.append(f"  `{p['api_url']}`")
-                    lines.append("")
-            except Exception:
-                pass
-
-            lines.append(t("gateway.model.usage_switch_model"))
-            lines.append(t("gateway.model.usage_switch_provider"))
-            lines.append(t("gateway.model.usage_persist"))
-            return "\n".join(lines)
-
-        # Perform the switch
-        result = _switch_model(
-            raw_input=model_input,
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=persist_global,
-            explicit_provider=explicit_provider,
-            user_providers=user_provs,
-            custom_providers=custom_provs,
-        )
-
-        if not result.success:
-            return t("gateway.model.error_prefix", error=result.error_message)
-
-        # If there's a cached agent, update it in-place
-        cached_entry = None
-        _cache_lock = getattr(self, "_agent_cache_lock", None)
-        _cache = getattr(self, "_agent_cache", None)
-        if _cache_lock and _cache is not None:
-            with _cache_lock:
-                cached_entry = _cache.get(session_key)
-
-        if cached_entry and cached_entry[0] is not None:
-            try:
-                cached_entry[0].switch_model(
-                    new_model=result.new_model,
-                    new_provider=result.target_provider,
-                    api_key=result.api_key,
-                    base_url=result.base_url,
-                    api_mode=result.api_mode,
-                )
-            except Exception as exc:
-                logger.warning("In-place model switch failed for cached agent: %s", exc)
-
-        # Persist the new model to the session DB so the dashboard
-        # shows the updated model (#34850).
-        _sess_db = getattr(self, "_session_db", None)
-        if _sess_db is not None:
-            try:
-                _sess_entry = self.session_store.get_or_create_session(source)
-                _sess_db.update_session_model(
-                    _sess_entry.session_id, result.new_model
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Failed to persist model switch to DB: %s", exc
-                )
-
-        # Store a note to prepend to the next user message so the model
-        # knows about the switch (avoids system messages mid-history).
-        if not hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes = {}
-        self._pending_model_notes[session_key] = (
-            f"[Note: model was just switched from {current_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
-
-        # Store session override so next agent creation uses the new model
-        self._session_model_overrides[session_key] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-        }
-
-        # Evict cached agent so the next turn creates a fresh agent from the
-        # override rather than relying on cache signature mismatch detection.
-        self._evict_cached_agent(session_key)
-
-        # Persist to config if --global
-        if persist_global:
+        def _save_config_key(key: str, value):
+            """Persist a dotted key to config.yaml."""
             try:
                 if config_path.exists():
                     with open(config_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
+                        cfg_data = yaml.safe_load(f) or {}
                 else:
-                    cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
+                    cfg_data = {}
+                parts = key.split(".")
+                d = cfg_data
+                for part in parts[:-1]:
+                    if part not in d or not isinstance(d[part], dict):
+                        d[part] = {}
+                    d = d[part]
+                d[parts[-1]] = value
                 from hermes_cli.config import save_config
-                save_config(cfg)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
+                save_config(cfg_data)
+            except Exception as exc:
+                logger.warning("model_cmd: failed to save config key %s: %s", key, exc)
 
-        # Build confirmation message with full metadata
-        provider_label = result.provider_label or result.target_provider
-        lines = [t("gateway.model.switched", model=result.new_model)]
-        lines.append(t("gateway.model.provider_label", provider=provider_label))
+        def _session_switch_fn(provider: str, model: str, codex_home=None, **_kwargs):
+            """Apply model switch to the running session override."""
+            # Build override dict for session
+            new_override = dict(override)
+            new_override["model"] = model
+            new_override["provider"] = provider
+            if codex_home:
+                new_override["codex_home"] = codex_home
+            else:
+                new_override.pop("codex_home", None)
+            self._session_model_overrides[session_key] = new_override
+            # Evict cached agent so next request creates fresh one
+            self._evict_cached_agent(session_key)
 
-        # Context: always resolve via the provider-aware chain so Codex OAuth,
-        # Copilot, and Nous-enforced caps win over the raw models.dev entry.
-        mi = result.model_info
-        from hermes_cli.model_switch import resolve_display_context_length
-        _sw2_config_ctx = None
-        try:
-            _sw2_cfg = _load_gateway_config()
-            _sw2_model_cfg = _sw2_cfg.get("model", {})
-            if isinstance(_sw2_model_cfg, dict):
-                _sw2_raw = _sw2_model_cfg.get("context_length")
-                if _sw2_raw is not None:
-                    _sw2_config_ctx = int(_sw2_raw)
-        except Exception:
-            pass
-        ctx = resolve_display_context_length(
-            result.new_model,
-            result.target_provider,
-            base_url=result.base_url or current_base_url or "",
-            api_key=result.api_key or current_api_key or "",
-            model_info=mi,
-            custom_providers=custom_provs,
-            config_context_length=_sw2_config_ctx,
+        result = handle_model_command(
+            raw_args=raw_args,
+            current_alias=current_alias,
+            config={},
+            current_provider=current_provider,
+            current_model_value=current_model,
+            save_config_fn=_save_config_key,
+            session_switch_fn=_session_switch_fn,
         )
-        if ctx:
-            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
-        if mi:
-            if mi.max_output:
-                lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
-            if mi.has_cost_data():
-                lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
-            lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
 
-        # Cache notice
-        cache_enabled = (
-            (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-            or result.api_mode == "anthropic_messages"
-        )
-        if cache_enabled:
-            lines.append(t("gateway.model.prompt_caching_enabled"))
+        # If a new alias was selected, update session overrides
+        new_alias = result.get("new_alias")
+        if new_alias:
+            new_override = dict(self._session_model_overrides.get(session_key, {}))
+            if result.get("auto_mode"):
+                for key in ("model", "provider", "codex_home", "api_key", "base_url", "api_mode"):
+                    new_override.pop(key, None)
+                new_override["selected_model_alias"] = "auto"
+                self._session_model_overrides[session_key] = new_override
+                self._evict_cached_agent(session_key)
+                if not hasattr(self, "_pending_model_notes"):
+                    self._pending_model_notes = {}
+                self._pending_model_notes[session_key] = (
+                    "[Note: model preference switched to automatic mode. "
+                    "The actual execution model is selected at each new task boundary.]"
+                )
+            else:
+                entry = get_model_by_alias(new_alias)
+                if entry:
+                    new_override["selected_model_alias"] = new_alias
+                    self._session_model_overrides[session_key] = new_override
+                    self._evict_cached_agent(session_key)
 
-        if result.warning_message:
-            lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
+                    # Store model note for the agent to know about the switch
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    codex_note = f" (CODEX_HOME={entry.codex_home})" if entry.codex_home else ""
+                    self._pending_model_notes[session_key] = (
+                        f"[Note: model preference switched to {new_alias} "
+                        f"({entry.provider}/{entry.model}){codex_note}. "
+                        f"Adjust your self-identification accordingly.]"
+                    )
 
-        if persist_global:
-            lines.append(t("gateway.model.saved_global"))
-        else:
-            lines.append(t("gateway.model.session_only_hint"))
+        parts = result.get("parts")
+        from gateway.config import Platform
+        if event.source.platform == Platform.TELEGRAM and parts and len(result.get("text", "")) > 1500:
+            for part in parts[:-1]:
+                await self._deliver_platform_notice(event.source, part)
+            return parts[-1]
 
-        return "\n".join(lines)
+        return result["text"]
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
@@ -12639,6 +12746,7 @@ class GatewayRunner:
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
+                task=self._model_selector_task(task_id=task_id, message=prompt),
             )
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
@@ -12680,9 +12788,11 @@ class GatewayRunner:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                agent_runtime = dict(turn_route["runtime"])
+                agent_codex_home = agent_runtime.pop("codex_home", None)
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **turn_route["runtime"],
+                    **agent_runtime,
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -12707,8 +12817,9 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=turn_route.get("fallback_model") or [],
                 )
+                agent.codex_home = agent_codex_home
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -12806,9 +12917,14 @@ class GatewayRunner:
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
+                error_text = str(e)
+                if "No executable model available" in error_text:
+                    content = f"❌ Background task {task_id} skipped: {error_text}"
+                else:
+                    content = f"❌ Background task {task_id} failed: {error_text}"
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
+                    content=content,
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -13208,8 +13324,10 @@ class GatewayRunner:
                     partial = False
                     head = msgs
 
+            tmp_runtime_kwargs = dict(runtime_kwargs)
+            tmp_codex_home = tmp_runtime_kwargs.pop("codex_home", None)
             tmp_agent = AIAgent(
-                **runtime_kwargs,
+                **tmp_runtime_kwargs,
                 model=model,
                 max_iterations=4,
                 quiet_mode=True,
@@ -13217,6 +13335,7 @@ class GatewayRunner:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
             )
+            tmp_agent.codex_home = tmp_codex_home
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
 
@@ -15600,6 +15719,33 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
+    async def _send_startup_lifecycle_notifications(self) -> None:
+        """Send gateway-online lifecycle notifications after startup.
+
+        Home channels are notified on every successful gateway start, not only
+        when a planned restart marker exists. This covers crash recovery and
+        operator paths such as SIGKILL followed by systemd start, where the old
+        process cannot write marker files before dying.
+        """
+        planned_restart_notification_pending = _planned_restart_notification_pending()
+        delivered_restart_target = await self._send_restart_notification()
+
+        # Chat-originated /restart gets a precise "restarted" reply. Avoid a
+        # duplicate home-channel "online" message when the configured home
+        # channel is the same chat/topic. Non-chat planned restarts and crash
+        # recoveries still notify the home channel.
+        skip_targets: set[tuple[str, str, Optional[str]]] = set()
+        if delivered_restart_target is not None:
+            skip_targets.add(delivered_restart_target)
+
+        try:
+            await self._send_home_channel_startup_notifications(
+                skip_targets=skip_targets,
+            )
+        finally:
+            if planned_restart_notification_pending:
+                _clear_planned_restart_notification()
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -16321,6 +16467,7 @@ class GatewayRunner:
                 runtime.get("base_url", ""),
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
+                runtime.get("codex_home", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
@@ -16348,8 +16495,23 @@ class GatewayRunner:
         override = self._session_model_overrides.get(session_key)
         if not override:
             return model, runtime_kwargs
+        selected_alias = override.get("selected_model_alias")
+        if selected_alias:
+            try:
+                from agent.model_registry import get_model_by_alias
+                entry = get_model_by_alias(selected_alias)
+            except Exception:
+                entry = None
+            if entry:
+                if not entry.supports_execute:
+                    return model, runtime_kwargs
+                model = entry.model
+                runtime_kwargs["provider"] = entry.provider
+                if entry.codex_home:
+                    runtime_kwargs["codex_home"] = entry.codex_home
+                return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "codex_home"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
@@ -16358,7 +16520,19 @@ class GatewayRunner:
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
         """Return True if *agent_model* matches an active /model session override."""
         override = self._session_model_overrides.get(session_key)
-        return override is not None and override.get("model") == agent_model
+        if not override:
+            return False
+        if override.get("model") == agent_model:
+            return True
+        selected_alias = override.get("selected_model_alias")
+        if selected_alias:
+            try:
+                from agent.model_registry import get_model_by_alias
+                entry = get_model_by_alias(selected_alias)
+                return entry is not None and entry.model == agent_model
+            except Exception:
+                return False
+        return False
 
     def _release_running_agent_state(
         self,
@@ -17112,7 +17286,7 @@ class GatewayRunner:
                     user_config,
                     platform_key,
                     "interim_assistant_messages",
-                    True,
+                    False if source.platform == Platform.TELEGRAM else True,
                 )
             )
         )
@@ -17775,14 +17949,20 @@ class GatewayRunner:
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    task=self._model_selector_task(session_id=session_id, message=message),
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                error_text = str(exc)
+                if "No executable model available" in error_text:
+                    final_response = f"⚠️ {error_text}"
+                else:
+                    final_response = f"⚠️ Provider authentication failed: {error_text}"
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": final_response,
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -17904,12 +18084,14 @@ class GatewayRunner:
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_busting_keys = self._extract_cache_busting_config(user_config)
+            _cache_busting_keys["fallback_model"] = turn_route.get("fallback_model") or []
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_busting_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -17933,9 +18115,11 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
+                agent_runtime = dict(turn_route["runtime"])
+                agent_codex_home = agent_runtime.pop("codex_home", None)
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **turn_route["runtime"],
+                    **agent_runtime,
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -17963,8 +18147,10 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=turn_route.get("fallback_model") or [],
                 )
+                agent.codex_home = agent_codex_home
+                agent.codex_home = turn_route["runtime"].get("codex_home")
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
@@ -18444,6 +18630,7 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _resolved_provider = getattr(_agent, "provider", None) if _agent else None
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -18464,6 +18651,7 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": _resolved_provider,
                     "context_length": _context_length,
                 }
             
@@ -18620,6 +18808,7 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
@@ -18771,6 +18960,13 @@ class GatewayRunner:
                     try:
                         _a = _agent_ref.get_activity_summary()
                         _parts = []
+                        _phase = _a.get("phase")
+                        if _phase:
+                            _parts.append(f"phase {_phase}")
+                        _route_attempt = _a.get("route_attempt")
+                        _route_total = _a.get("route_total")
+                        if _route_attempt and _route_total:
+                            _parts.append(f"route {_route_attempt}/{_route_total}")
                         if _want_iteration_detail:
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
@@ -18878,6 +19074,7 @@ class GatewayRunner:
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
                     _idle_secs = 0.0
+                    _act = {}
                     if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                         try:
                             _act = _agent_ref.get_activity_summary()
@@ -18885,17 +19082,25 @@ class GatewayRunner:
                         except Exception:
                             pass
                     # Staged warning: fire once before escalating to full timeout.
-                    if (not _warning_fired and _agent_warning is not None
-                            and _idle_secs >= _agent_warning):
+                    _phase = (_act.get("phase") if isinstance(_act, dict) else None) or "unknown"
+                    _phase_warning = {
+                        "model_wait": 120,
+                        "compression": 120,
+                        "fallback": 120,
+                        "tool": 300,
+                    }.get(_phase, _agent_warning)
+                    if (not _warning_fired and _phase_warning is not None
+                            and _idle_secs >= _phase_warning):
                         _warning_fired = True
                         _warn_adapter = self.adapters.get(source.platform)
                         if _warn_adapter:
-                            _elapsed_warn = int(_agent_warning // 60) or 1
-                            _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
+                            _elapsed_warn = int(_phase_warning // 60) or 1
+                            _remaining_mins = int((_agent_timeout - _phase_warning) // 60) or 1
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
+                                    f"⚠️ No activity for {_elapsed_warn} min during `{_phase}`. "
+                                    f"Last activity: {_act.get('last_activity_desc', 'unknown')}. "
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
                                     f"You can continue waiting or use /reset.",

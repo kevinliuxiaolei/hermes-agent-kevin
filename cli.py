@@ -3342,6 +3342,40 @@ class HermesCLI:
         # ``fallback_model`` entries so old configs still participate.
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
 
+        # ── Unified registry-based fallback (quota-aware) ────────────────────
+        # Build a quota-aware fallback chain from the model registry.
+        # If available, this PREPENDS to the legacy chain so quota-exhausted
+        # codex entries don't fire before available antigravity models.
+        # Falls back silently to legacy chain on any import/quota error.
+        self._selected_model_alias = None
+        self._selected_codex_home = None
+        try:
+            from agent.model_selector import get_selected_alias_from_config
+            from agent.model_registry import get_model_by_alias
+            from agent.route_plan import build_route_plan
+            self._selected_model_alias = get_selected_alias_from_config(CLI_CONFIG or {})
+            _selected_entry = get_model_by_alias(self._selected_model_alias) if self._selected_model_alias else None
+            self._selected_codex_home = _selected_entry.codex_home if _selected_entry else None
+            _plan = build_route_plan(
+                task="chat",
+                preferred_alias=self._selected_model_alias,
+                current_provider=_selected_entry.provider if _selected_entry else self.provider,
+                current_model=_selected_entry.model if _selected_entry else self.model,
+                current_codex_home=_selected_entry.codex_home if _selected_entry else None,
+                current_base_url=self.base_url,
+                config=CLI_CONFIG or {},
+                configured_entries=self._fallback_model,
+            )
+            if _plan.fallbacks:
+                self._fallback_model = _plan.legacy_fallback_model()
+                logger.debug(
+                    "route plan fallback chain: %s",
+                    [(d["provider"], d["model"]) for d in self._fallback_model]
+                )
+        except Exception as _e:
+            logger.debug("registry fallback chain build failed (using legacy): %s", _e)
+
+
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
         # turns (e.g. after /model or credential rotation).
@@ -3681,7 +3715,23 @@ class HermesCLI:
         # _try_activate_fallback() switches provider/model.
         agent = getattr(self, "agent", None)
         model_name = (getattr(agent, "model", None) or self.model or "unknown")
+        provider_name = (getattr(agent, "provider", None) or getattr(self, "provider", "") or "")
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
+        try:
+            from agent.model_registry import resolve_alias_from_config_model
+            actual_alias = resolve_alias_from_config_model(provider_name, model_name)
+            if actual_alias:
+                model_short = actual_alias
+        except Exception:
+            pass
+        if provider_name == "antigravity-acp":
+            try:
+                from agent.agy_slot_state import get_last_executed_slot
+                slot = get_last_executed_slot(max_age_seconds=3600)
+                if slot:
+                    model_short = f"{model_short}@{slot}"
+            except Exception:
+                pass
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
         if len(model_short) > 26:
@@ -4878,11 +4928,64 @@ class HermesCLI:
             format_runtime_provider_error,
         )
 
+        if str(getattr(self, "_selected_model_alias", "") or "").strip().lower() == "auto":
+            try:
+                from agent.model_selector import select_model_with_reason
+
+                selection = select_model_with_reason(task="chat", preferred_alias="auto")
+                entry = selection.entry
+                if entry is not None:
+                    route_changed = (
+                        self.model != entry.model
+                        or self.requested_provider != entry.provider
+                        or getattr(self, "_selected_codex_home", None) != entry.codex_home
+                    )
+                    self.model = entry.model
+                    self.requested_provider = entry.provider
+                    self._selected_codex_home = entry.codex_home
+                    if route_changed:
+                        self.agent = None
+                        self._active_agent_route_signature = None
+                        logger.info(
+                            "CLI automatic model preference selected alias=%s provider=%s model=%s reason=%s",
+                            entry.alias,
+                            entry.provider,
+                            entry.model,
+                            selection.reason,
+                        )
+            except Exception as exc:
+                logger.warning("CLI automatic model preference resolution failed: %s", exc)
+
+        def _resolve_runtime(*, requested, target_model=None, codex_home=None, **kwargs):
+            old_codex_home = os.environ.get("CODEX_HOME")
+            old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+            if codex_home:
+                os.environ["CODEX_HOME"] = codex_home
+                os.environ["HERMES_CODEX_HOME"] = codex_home
+            try:
+                return resolve_runtime_provider(
+                    requested=requested,
+                    target_model=target_model,
+                    **kwargs,
+                )
+            finally:
+                if codex_home:
+                    if old_codex_home is None:
+                        os.environ.pop("CODEX_HOME", None)
+                    else:
+                        os.environ["CODEX_HOME"] = old_codex_home
+                    if old_hermes_codex_home is None:
+                        os.environ.pop("HERMES_CODEX_HOME", None)
+                    else:
+                        os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
+
         _primary_exc = None
         runtime = None
         try:
-            runtime = resolve_runtime_provider(
+            runtime = _resolve_runtime(
                 requested=self.requested_provider,
+                target_model=self.model,
+                codex_home=getattr(self, "_selected_codex_home", None),
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
             )
@@ -4900,7 +5003,11 @@ class HermesCLI:
                     if not _fb_provider or not _fb_model:
                         continue
                     try:
-                        runtime = resolve_runtime_provider(requested=_fb_provider)
+                        runtime = _resolve_runtime(
+                            requested=_fb_provider,
+                            target_model=_fb_model,
+                            codex_home=_fb.get("codex_home"),
+                        )
                         logger.warning(
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
@@ -5033,6 +5140,20 @@ class HermesCLI:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        try:
+            from agent.route_plan import build_route_plan
+            plan = build_route_plan(
+                task="chat",
+                preferred_alias=getattr(self, "_selected_model_alias", None),
+                current_provider=self.provider,
+                current_model=self.model,
+                current_codex_home=getattr(self, "_selected_codex_home", None),
+                current_base_url=self.base_url,
+                config=getattr(self, "config", {}) or {},
+            )
+            self._fallback_model = plan.legacy_fallback_model()
+        except Exception as exc:
+            logger.debug("turn route plan build failed; retaining previous fallback chain: %s", exc)
         route = {
             "model": self.model,
             "runtime": runtime,
@@ -5043,6 +5164,7 @@ class HermesCLI:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                repr(self._fallback_model),
             ),
         }
 
@@ -8066,18 +8188,99 @@ class HermesCLI:
         """Handle /model command — switch model for this session.
 
         Supports:
-          /model                              — show current model + usage hints
-          /model <name>                       — switch for this session only
-          /model <name> --global              — switch and persist to config.yaml
-          /model <name> --provider <provider> — switch provider + model
-          /model --provider <provider>        — switch to provider, auto-detect model
+          /model                              — show unified model directory with quota
+          /model refresh                      — refresh quota then show directory
+          /model <alias>                      — switch via unified registry alias
+          /model <alias> --global             — switch and persist to config.yaml
+          /model <name> --provider <provider> — legacy: switch provider + model directly
+          /model --provider <provider>        — legacy: switch to provider, auto-detect model
         """
-        from hermes_cli.model_switch import switch_model, parse_model_flags
-        from hermes_cli.providers import get_label
-
         # Parse args from the original command
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
+
+        # Check for --provider flag (legacy path bypass)
+        has_explicit_provider = "--provider" in raw_args
+
+        # ── Unified Registry Path ────────────────────────────────────────────
+        # When NO --provider flag is given, try the unified model_command handler
+        # which covers: no args (list), alias switching, refresh, --global persist.
+        if not has_explicit_provider:
+            try:
+                from agent.model_command import handle_model_command
+
+                # Determine current alias from session or config
+                current_alias = getattr(self, "_selected_model_alias", None)
+                if not current_alias:
+                    try:
+                        from agent.model_selector import get_selected_alias_from_config
+                        cfg = getattr(self, "config", {}) or {}
+                        current_alias = get_selected_alias_from_config(cfg)
+                    except Exception:
+                        current_alias = None
+
+                def _save_cfg(key, value):
+                    save_config_value(key, value)
+
+                def _session_switch(provider, model, codex_home=None, **_kwargs):
+                    """Apply model switch to running agent."""
+                    old_model = self.model
+                    self.model = model
+                    self.provider = provider
+                    self.requested_provider = provider
+                    self._selected_codex_home = codex_home
+                    self._explicit_api_key = None
+                    self._explicit_base_url = None
+                    self.agent = None
+                    self._active_agent_route_signature = None
+                    self._pending_model_switch_note = (
+                        f"[Note: model was just switched from {old_model} to {model} "
+                        f"via {provider}. Adjust your self-identification accordingly.]"
+                    )
+
+                result = handle_model_command(
+                    raw_args=raw_args,
+                    current_alias=current_alias,
+                    config=getattr(self, "config", {}),
+                    save_config_fn=_save_cfg,
+                    session_switch_fn=_session_switch,
+                )
+
+                # Print output lines
+                for line in result["text"].splitlines():
+                    _cprint(f"  {line}" if line and not line.startswith("  ") else line)
+
+                # Update session alias tracking
+                if result.get("new_alias"):
+                    self._selected_model_alias = result["new_alias"]
+                    if result.get("auto_mode"):
+                        self._selected_codex_home = None
+                        self.agent = None
+                        self._active_agent_route_signature = None
+                        self._pending_model_switch_note = (
+                            "[Note: model preference switched to automatic mode. "
+                            "The actual execution model is selected at each new task boundary.]"
+                        )
+                    # For executable models, also update the session model/provider
+                    elif result.get("new_provider") and result.get("new_model"):
+                        # Check if the model supports_execute
+                        try:
+                            from agent.model_registry import get_model_by_alias
+                            entry = get_model_by_alias(result["new_alias"])
+                            if entry and not entry.supports_execute:
+                                # Don't actually switch the runtime for non-executable models
+                                pass
+                        except Exception:
+                            pass
+                return
+
+            except Exception as _registry_err:
+                # Registry path failed — fall through to legacy handler
+                logger.debug("Unified model registry path failed: %s; falling back", _registry_err)
+
+        # ── Legacy Path (--provider flag or registry fallback) ───────────────
+        from hermes_cli.model_switch import switch_model, parse_model_flags
+        from hermes_cli.providers import get_label
 
         # Parse --provider, --global, and --refresh flags
         model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
@@ -8128,8 +8331,8 @@ class HermesCLI:
             if not providers:
                 _cprint("  No authenticated providers found.")
                 _cprint("")
-                _cprint("  /model <name>                        switch model")
-                _cprint("  /model --provider <slug>             switch provider")
+                _cprint("  /model <alias>                       switch model (unified registry)")
+                _cprint("  /model --provider <slug>             switch provider (legacy)")
                 _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 
@@ -8247,6 +8450,7 @@ class HermesCLI:
             _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
+
 
     def _handle_codex_runtime(self, cmd_original: str) -> None:
         """Handle /codex-runtime — toggle the codex app-server runtime opt-in.

@@ -231,6 +231,37 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
     assert "25%" in out
 
 
+def test_build_footer_shows_requested_and_executed_when_different(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {"enabled": True}}},
+        platform_key="telegram",
+        model="models/gemini-flash-lite-latest",
+        requested_alias="gemini-medium",
+        requested_model="models/gemini-flash-lite-latest",
+        executed_alias="nv-fallback",
+        executed_model="nv-fallback",
+        context_tokens=10,
+        context_length=100,
+        cwd="/work",
+    )
+    assert "req:gemini-medium -> run:nv-fallback" in out
+    assert "10%" in out
+
+
+def test_build_footer_shows_executed_slot():
+    out = format_runtime_footer(
+        model="models/gemini-flash-lite-latest",
+        executed_alias="gemini-low",
+        executed_slot="secondary",
+        context_tokens=10,
+        context_length=100,
+        cwd="",
+        fields=("model",),
+    )
+    assert out == "gemini-low@secondary"
+
+
 def test_build_footer_per_platform_off_suppresses():
     user = {
         "display": {

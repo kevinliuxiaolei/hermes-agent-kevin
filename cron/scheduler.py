@@ -112,6 +112,117 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _run_with_codex_home(codex_home: str | None, fn):
+    """Run a resolver with CODEX_HOME scoped to a registry Codex account."""
+    if not codex_home:
+        return fn()
+    old_codex_home = os.environ.get("CODEX_HOME")
+    old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+    os.environ["CODEX_HOME"] = codex_home
+    os.environ["HERMES_CODEX_HOME"] = codex_home
+    try:
+        return fn()
+    finally:
+        if old_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = old_codex_home
+        if old_hermes_codex_home is None:
+            os.environ.pop("HERMES_CODEX_HOME", None)
+        else:
+            os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
+
+
+def _same_registry_route(entry, provider: str | None, model: str | None, codex_home: str | None) -> bool:
+    """Compare provider/model plus Codex account scope when present."""
+    provider_norm = (provider or "").strip().lower()
+    model_norm = (model or "").strip()
+    if not provider_norm or not model_norm:
+        return False
+    if entry.provider.lower() != provider_norm or entry.model != model_norm:
+        return False
+    return (entry.codex_home or None) == (codex_home or None)
+
+
+def _fallback_route_key(entry: dict) -> tuple[str, str, str]:
+    """Stable de-dup key for legacy fallback dicts."""
+    return (
+        str(entry.get("provider") or "").strip().lower(),
+        str(entry.get("model") or "").strip(),
+        str(entry.get("codex_home") or "").strip(),
+    )
+
+
+def _same_legacy_route(entry: dict, provider: str | None, model: str | None, codex_home: str | None) -> bool:
+    """Compare a legacy fallback dict with the active runtime route."""
+    provider_norm = (provider or "").strip().lower()
+    model_norm = (model or "").strip()
+    codex_norm = (codex_home or "").strip()
+    return _fallback_route_key(entry) == (provider_norm, model_norm, codex_norm)
+
+
+def _normalize_configured_fallbacks(configured_fallback_model) -> list[dict]:
+    """Return user-configured fallback entries as a list of dicts."""
+    if not configured_fallback_model:
+        return []
+    entries = configured_fallback_model if isinstance(configured_fallback_model, list) else [configured_fallback_model]
+    return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+
+def _build_cron_registry_fallback_model(
+    *,
+    task: str,
+    preferred_alias: str | None,
+    current_provider: str | None = None,
+    current_model: str | None = None,
+    current_codex_home: str | None = None,
+    user_config: dict | None = None,
+    configured_fallback_model=None,
+) -> list:
+    """Build the fallback chain used by non-interactive cron runs.
+
+    Cron should use the quota-aware registry, but it must not discard the
+    operator's explicit ``fallback_providers``.  Those often contain same-family
+    backup endpoints (for example volcengine-agent-plan → volcengine-coding-plan)
+    that the registry intentionally collapses to one route group.  Preserve the
+    configured order first, then append registry candidates to regain broad
+    cross-provider failover.
+    """
+    from agent.route_plan import build_route_plan
+
+    plan = build_route_plan(
+        task=task or "cron",
+        preferred_alias=preferred_alias,
+        current_provider=current_provider,
+        current_model=current_model,
+        current_codex_home=current_codex_home,
+        config=user_config,
+        configured_entries=configured_fallback_model,
+    )
+    return plan.legacy_fallback_model()
+
+
+def _resolve_cron_runtime_for_model_entry(entry) -> dict:
+    """Resolve runtime credentials for a registry entry without leaking CODEX_HOME."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    def _resolve():
+        return resolve_runtime_provider(
+            requested=entry.provider,
+            target_model=entry.model,
+        )
+
+    runtime = _run_with_codex_home(entry.codex_home, _resolve)
+    runtime = dict(runtime or {})
+    runtime["provider"] = entry.provider
+    if entry.codex_home:
+        runtime["codex_home"] = entry.codex_home
+    else:
+        runtime.pop("codex_home", None)
+    return runtime
+
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -757,11 +868,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"——\n"
+            f"任务：{task_name}（ID: {job_id}）\n"
+            f"管理：回复 `stop reminder {task_name}` 可停止。"
         )
     else:
         delivery_content = content
@@ -1639,7 +1749,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
+                        model = (
+                            _model_cfg.get("default")
+                            or _model_cfg.get("model")
+                            or _model_cfg.get("name")
+                            or model
+                        )
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -1686,51 +1801,139 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
+        configured_fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        fallback_model = configured_fallback_model
+        runtime = None
+        job_has_explicit_route = bool(job.get("model") or job.get("provider") or job.get("base_url"))
+
+        if not job_has_explicit_route:
+            try:
+                from agent.model_selector import select_model_with_reason
+
+                selected_alias = ((_cfg.get("model_selection") or {}).get("selected_model_alias") or None)
+                if selected_alias:
+                    selection = select_model_with_reason(
+                        task="cron",
+                        preferred_alias=selected_alias,
+                        refresh_quota=False,
+                    )
+                    selected_entry = selection.entry
+                    if selected_entry is not None:
+                        model = selected_entry.model
+                        runtime = _resolve_cron_runtime_for_model_entry(selected_entry)
+                        fallback_model = _build_cron_registry_fallback_model(
+                            task="cron",
+                            preferred_alias=selected_alias,
+                            current_provider=selected_entry.provider,
+                            current_model=selected_entry.model,
+                            current_codex_home=selected_entry.codex_home,
+                            user_config=_cfg,
+                            configured_fallback_model=configured_fallback_model,
+                        )
+                        logger.info(
+                            "Job '%s': model_selector selected alias=%s actual=%s "
+                            "provider=%s reason=%s fallback=%s",
+                            job_id,
+                            selected_alias,
+                            selected_entry.alias,
+                            selected_entry.provider,
+                            selection.reason,
+                            [f.get("alias") or f.get("model") for f in (fallback_model or []) if isinstance(f, dict)],
+                        )
+                    else:
+                        logger.warning(
+                            "Job '%s': model_selector found no executable model for alias=%s; "
+                            "falling back to legacy runtime. skipped=%s",
+                            job_id,
+                            selected_alias,
+                            selection.skipped[:5],
+                        )
+            except Exception as selector_exc:
+                logger.warning(
+                    "Job '%s': model_selector resolution failed, falling back to legacy runtime: %s",
+                    job_id,
+                    selector_exc,
+                )
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
         from hermes_cli.auth import AuthError
-        try:
-            # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
-            # already prefers persisted config over stale shell/env overrides when
-            # no explicit provider is requested. Passing the env var here short-
-            # circuits that precedence and can resurrect old providers (for
-            # example DeepSeek) for cron jobs that do not pin provider/model.
-            runtime_kwargs = {
-                "requested": job.get("provider"),
-            }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs)
-        except AuthError as auth_exc:
-            # Primary provider auth failed — try fallback chain before giving up.
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
-            fb_list = (fb if isinstance(fb, list) else [fb]) if fb else []
-            runtime = None
-            for entry in fb_list:
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    fb_kwargs = {"requested": entry.get("provider")}
-                    if entry.get("base_url"):
-                        fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    if entry.get("api_key"):
-                        fb_kwargs["explicit_api_key"] = entry["api_key"]
-                    runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
-                    break
-                except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
-            if runtime is None:
-                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
-        except Exception as exc:
-            message = format_runtime_provider_error(exc)
-            raise RuntimeError(message) from exc
+        if runtime is None:
+            try:
+                # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
+                # already prefers persisted config over stale shell/env overrides when
+                # no explicit provider is requested. Passing the env var here short-
+                # circuits that precedence and can resurrect old providers (for
+                # example DeepSeek) for cron jobs that do not pin provider/model.
+                runtime_kwargs = {
+                    "requested": job.get("provider"),
+                }
+                if job.get("base_url"):
+                    runtime_kwargs["explicit_base_url"] = job.get("base_url")
+                runtime = resolve_runtime_provider(**runtime_kwargs)
+            except AuthError as auth_exc:
+                # Primary provider auth failed — try fallback chain before giving up.
+                logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
+                fb_list = (fallback_model if isinstance(fallback_model, list) else [fallback_model]) if fallback_model else []
+                runtime = None
+                for entry in fb_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        fb_kwargs = {"requested": entry.get("provider")}
+                        if entry.get("base_url"):
+                            fb_kwargs["explicit_base_url"] = entry["base_url"]
+                        if entry.get("api_key"):
+                            fb_kwargs["explicit_api_key"] = entry["api_key"]
+                        runtime = _run_with_codex_home(
+                            entry.get("codex_home"),
+                            lambda: resolve_runtime_provider(**fb_kwargs),
+                        )
+                        if entry.get("codex_home"):
+                            runtime = dict(runtime or {})
+                            runtime["codex_home"] = entry["codex_home"]
+                        logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                        break
+                    except Exception as fb_exc:
+                        logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
+                if runtime is None:
+                    raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+            except Exception as exc:
+                message = format_runtime_provider_error(exc)
+                raise RuntimeError(message) from exc
 
-        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        if job_has_explicit_route:
+            try:
+                fallback_model = _build_cron_registry_fallback_model(
+                    task="cron",
+                    preferred_alias=None,
+                    current_provider=job.get("provider") or runtime.get("provider"),
+                    current_model=model,
+                    current_codex_home=runtime.get("codex_home"),
+                    user_config=_cfg,
+                    configured_fallback_model=configured_fallback_model,
+                )
+                logger.info(
+                    "Job '%s': explicit route provider=%s model=%s fallback=%s",
+                    job_id,
+                    job.get("provider") or runtime.get("provider"),
+                    model,
+                    [
+                        entry.get("alias") or entry.get("model")
+                        for entry in fallback_model
+                        if isinstance(entry, dict)
+                    ],
+                )
+            except Exception as selector_exc:
+                logger.warning(
+                    "Job '%s': failed to append registry fallback candidates "
+                    "for explicit route; using configured fallbacks only: %s",
+                    job_id,
+                    selector_exc,
+                )
+
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -1769,6 +1972,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        agent_codex_home = runtime.get("codex_home")
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1800,7 +2004,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            codex_home=agent_codex_home,
         )
+        agent.codex_home = agent_codex_home
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

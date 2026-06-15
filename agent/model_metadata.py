@@ -1517,6 +1517,19 @@ def get_model_context_length(
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
+    # 0a. Unified registry context override
+    try:
+        from agent.model_registry import get_model_by_alias, get_model_by_provider_model
+        entry = get_model_by_alias(model)
+        if not entry:
+            entry = get_model_by_provider_model(provider or "antigravity-acp", model)
+        if entry:
+            limit = getattr(entry, "context_limit_tokens", None)
+            if limit is not None:
+                return limit
+    except Exception:
+        pass
+
     # 0b. custom_providers per-model override — check before any probe.
     # This closes the gap where /model switch and display paths used to fall
     # back to 128K despite the user having a per-model context_length set.

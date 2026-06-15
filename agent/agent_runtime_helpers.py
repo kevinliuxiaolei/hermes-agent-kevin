@@ -1270,7 +1270,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client_kwargs = dict(client_kwargs)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    if agent.provider in {"copilot-acp", "antigravity-acp"} or str(client_kwargs.get("base_url", "")).startswith("acp://"):
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
@@ -1971,8 +1971,24 @@ def looks_like_codex_intermediate_ack(
     assistant_content: str,
     messages: List[Dict[str, Any]],
 ) -> bool:
-    """Detect a planning/ack message that should continue instead of ending the turn."""
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    """Detect a planning/narration message that must not end the turn.
+
+    The historical name is retained for compatibility, but this is a
+    provider-independent terminal-response guard.
+    """
+    last_user_index = max(
+        (
+            index
+            for index, msg in enumerate(messages)
+            if isinstance(msg, dict) and msg.get("role") == "user"
+        ),
+        default=-1,
+    )
+    current_turn_messages = messages[last_user_index + 1 :]
+    if any(
+        isinstance(msg, dict) and msg.get("role") == "tool"
+        for msg in current_turn_messages
+    ):
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
@@ -2007,6 +2023,15 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        "ask",
+        "perform",
+        "add",
+        "update",
+        "modify",
+        "edit",
+        "create",
+        "write",
+        "implement",
     )
     workspace_markers = (
         "directory",

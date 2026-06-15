@@ -443,6 +443,7 @@ def classify_api_error(
     *,
     provider: str = "",
     model: str = "",
+    base_url: str = "",
     approx_tokens: int = 0,
     context_length: int = 200000,
     num_messages: int = 0,
@@ -531,9 +532,101 @@ def classify_api_error(
             "message": _extract_message(error, body),
         }
         defaults.update(overrides)
+        try:
+            from agent.route_health import record_route_failure
+            record_route_failure(
+                provider,
+                reason=reason.value,
+                status_code=status_code,
+                message=defaults["message"],
+                model=model,
+                base_url=base_url,
+            )
+        except Exception:
+            pass
         return ClassifiedError(**defaults)
 
+    if provider_lower == "nvidia_nim":
+        status = "unknown_error"
+        cooldown_sec = 900
+        execute_enabled = True
+
+        if status_code == 401 or status_code == 403:
+            status = "auth_error"
+            cooldown_sec = 0
+            execute_enabled = False
+        elif status_code == 402:
+            status = "quota_or_payment_error"
+            cooldown_sec = 86400
+        elif status_code == 404 or "model_not_found" in error_msg or "does not exist" in error_msg:
+            status = "model_not_found"
+            cooldown_sec = 0
+        elif status_code == 429 or any(p in error_msg for p in _RATE_LIMIT_PATTERNS):
+            status = "rate_limited"
+            cooldown_sec = 1800
+        elif status_code is not None and status_code >= 500:
+            status = "server_error"
+            cooldown_sec = 900
+        elif "timeout" in error_type.lower() or "timeout" in error_msg:
+            status = "timeout"
+            cooldown_sec = 900
+        else:
+            status = "unknown_error"
+            cooldown_sec = 900
+
+        try:
+            import json
+            import os
+            import time
+            state_file = "/home/lighthouse/.hermes/nvidia_state.json"
+            state = {}
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, "r") as f:
+                        state = json.load(f)
+                except Exception:
+                    pass
+            
+            state["status"] = status
+            state["last_error"] = str(error)
+            if cooldown_sec > 0:
+                state["cooldown_until"] = time.time() + cooldown_sec
+            if not execute_enabled:
+                state["execute_enabled"] = False
+            
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
+            with open(state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as _state_err:
+            logger.warning("Failed to write nvidia_state.json: %s", _state_err)
+
+        should_fallback = True
+        retryable = False if status in ("auth_error", "quota_or_payment_error", "rate_limited") else True
+        reason_map = {
+            "auth_error": FailoverReason.auth,
+            "quota_or_payment_error": FailoverReason.billing,
+            "rate_limited": FailoverReason.rate_limit,
+            "model_not_found": FailoverReason.model_not_found,
+            "timeout": FailoverReason.timeout,
+            "server_error": FailoverReason.server_error,
+            "unknown_error": FailoverReason.unknown
+        }
+        return _result(
+            reason_map.get(status, FailoverReason.unknown),
+            retryable=retryable,
+            should_fallback=should_fallback,
+            should_rotate_credential=False
+        )
+
     # ── 1. Provider-specific patterns (highest priority) ────────────
+    
+    # Subprocess/binary execution errors (e.g. copilot missing)
+    if "could not start copilot acp command" in error_msg or "install github copilot cli" in error_msg:
+        return _result(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=True,
+        )
 
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged

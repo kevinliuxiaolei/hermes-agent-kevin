@@ -1487,6 +1487,27 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "antigravity-acp":
+        acp_command = (
+            os.getenv("HERMES_ANTIGRAVITY_ACP_COMMAND", "").strip()
+            or (
+                "/home/lighthouse/.hermes/bin/agy_acp_bridge.py"
+                if os.path.isfile("/home/lighthouse/.hermes/bin/agy_acp_bridge.py")
+                else ""
+            )
+        )
+        acp_base_url = os.getenv("HERMES_ANTIGRAVITY_ACP_BASE_URL", "acp://antigravity").strip()
+        return {
+            "provider": "antigravity-acp",
+            "api_mode": "chat_completions",
+            "base_url": acp_base_url.rstrip("/"),
+            "api_key": "no-key-required",
+            "command": acp_command,
+            "args": [],
+            "source": "external_process",
+            "requested_provider": requested_provider,
+        }
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only

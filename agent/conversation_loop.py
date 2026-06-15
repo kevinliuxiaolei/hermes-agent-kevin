@@ -744,6 +744,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    narration_route_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -1352,8 +1353,8 @@ def run_conversation(
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
                 elif (
-                    agent.provider == "copilot-acp"
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
+                    agent.provider in {"copilot-acp", "antigravity-acp"}
+                    or str(agent.base_url or "").lower().startswith("acp://")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):
                     _use_streaming = False
@@ -1641,6 +1642,19 @@ def run_conversation(
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
                     continue  # Retry the API call
+
+                try:
+                    from agent.route_health import record_route_success
+                    record_route_success(
+                        agent.provider,
+                        model=getattr(agent, "model", "") or "",
+                        base_url=getattr(agent, "base_url", "") or "",
+                    )
+                    if agent.provider == "antigravity-acp":
+                        from agent.quota_gate import record_agy_success
+                        record_agy_success()
+                except Exception:
+                    pass
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -2367,6 +2381,7 @@ def run_conversation(
                     api_error,
                     provider=getattr(agent, "provider", "") or "",
                     model=getattr(agent, "model", "") or "",
+                    base_url=getattr(agent, "base_url", "") or "",
                     approx_tokens=approx_tokens,
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
@@ -4448,25 +4463,45 @@ def run_conversation(
                 agent._clear_status_buffer()
 
                 if (
-                    agent.api_mode == "codex_responses"
-                    and agent.valid_tool_names
-                    and codex_ack_continuations < 2
+                    agent.valid_tool_names
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,
                         assistant_content=final_response,
                         messages=messages,
                     )
                 ):
+                    if narration_route_continuations >= 1:
+                        agent._buffer_status(
+                            f"⚠️ {agent.model} returned process narration without a result; "
+                            "trying the next route."
+                        )
+                        if agent._try_activate_fallback():
+                            narration_route_continuations = 0
+                            codex_ack_continuations = 0
+                            agent._buffer_status(
+                                f"↻ Switched to fallback: {agent.model} ({agent.provider})"
+                            )
+                            continue
+                        failed = True
+                        final_response = (
+                            "Task failed: every available route returned process narration "
+                            "without an actionable result."
+                        )
+                        agent._flush_status_buffer()
+                        _turn_exit_reason = "narration_only_exhausted"
+                        break
+
+                    narration_route_continuations += 1
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)
-                    agent._emit_interim_assistant_message(interim_msg)
 
                     continue_msg = {
                         "role": "user",
                         "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
+                            "[System: Your previous message only described future actions. "
+                            "Continue now, execute the required work, and only send a final "
+                            "answer after producing an actual result.]"
                         ),
                     }
                     messages.append(continue_msg)
@@ -4474,6 +4509,7 @@ def run_conversation(
                     continue
 
                 codex_ack_continuations = 0
+                narration_route_continuations = 0
 
                 if truncated_response_parts:
                     final_response = "".join(truncated_response_parts) + final_response

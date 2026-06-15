@@ -2,6 +2,7 @@
 
 > Goal: implement the reviewed P0 -> P1 -> P2 routing improvements without interrupting running tasks.
 > Recovery rule: a replacement model should read `MODEL_ROUTING_STRATEGY.md` and this file before continuing.
+> Design version: v4.1.2
 
 ## Current Status
 
@@ -178,6 +179,18 @@
 - Post-restart `tools/hermes_model_doctor.py`: `DIAGNOSTIC STATUS: PASS`.
 - Post-restart RoutePlan still provides six ordered routes and keeps healthy paid/subscription routes before final free fallbacks.
 - Scoped `git diff --check` passed.
+
+
+### Deployment and Post-Review Fixes (2026-06-15 v4.1.1)
+
+- **Fix**: [Sync Docs] Add automated synchronization script for routing strategies
+- **Fix**: [Telegram] Fix checkmark display and implement registry-backed inline keyboard picker for auto-routing mode.
+
+
+### Deployment and Post-Review Fixes (2026-06-15 v4.1.2)
+
+- **Fix**: [Sync Docs] Add automated synchronization script for routing strategies
+- **Fix**: [Telegram] Fix checkmark display and implement registry-backed inline keyboard picker for auto-routing mode.
 
 ## Remaining Work
 

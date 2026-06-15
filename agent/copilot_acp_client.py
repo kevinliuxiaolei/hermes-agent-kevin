@@ -326,6 +326,19 @@ class _ACPChatCompletions:
         return self._client._create_chat_completion(**kwargs)
 
 
+class ACPStreamWrapper:
+    """Wraps a generator to mimic OpenAI's Stream object with .response."""
+    def __init__(self, generator):
+        self._generator = generator
+        self.response = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._generator)
+
+
 class _ACPChatNamespace:
     def __init__(self, client: "CopilotACPClient"):
         self.completions = _ACPChatCompletions(client)
@@ -383,7 +396,7 @@ class CopilotACPClient:
         timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
             messages or [],
@@ -413,6 +426,111 @@ class CopilotACPClient:
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+
+        if kwargs.get("stream"):
+            import uuid
+            def _chunk_generator():
+                if reasoning_text:
+                    yield SimpleNamespace(
+                        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        object="chat.completion.chunk",
+                        created=int(time.time()),
+                        model=model or "copilot-acp",
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                delta=SimpleNamespace(
+                                    role="assistant",
+                                    content=None,
+                                    tool_calls=None,
+                                    reasoning=reasoning_text,
+                                    reasoning_content=reasoning_text,
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                if tool_calls:
+                    for idx, tc in enumerate(tool_calls):
+                        yield SimpleNamespace(
+                            id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=model or "copilot-acp",
+                            choices=[
+                                SimpleNamespace(
+                                    index=0,
+                                    delta=SimpleNamespace(
+                                        role="assistant",
+                                        content=None,
+                                        tool_calls=[
+                                            SimpleNamespace(
+                                                index=idx,
+                                                id=tc.id,
+                                                type="function",
+                                                function=SimpleNamespace(
+                                                    name=tc.function.name,
+                                                    arguments=tc.function.arguments,
+                                                ),
+                                            )
+                                        ],
+                                        reasoning=None,
+                                        reasoning_content=None,
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            usage=None,
+                        )
+                elif cleaned_text:
+                    yield SimpleNamespace(
+                        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        object="chat.completion.chunk",
+                        created=int(time.time()),
+                        model=model or "copilot-acp",
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                delta=SimpleNamespace(
+                                    role="assistant",
+                                    content=cleaned_text,
+                                    tool_calls=None,
+                                    reasoning=None,
+                                    reasoning_content=None,
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                finish_reason = "tool_calls" if tool_calls else "stop"
+                yield SimpleNamespace(
+                    id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    model=model or "copilot-acp",
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(
+                                role="assistant",
+                                content=None,
+                                tool_calls=None,
+                                reasoning=None,
+                                reasoning_content=None,
+                            ),
+                            finish_reason=finish_reason,
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                    ),
+                )
+            return ACPStreamWrapper(_chunk_generator())
 
         usage = SimpleNamespace(
             prompt_tokens=0,

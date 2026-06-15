@@ -94,6 +94,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "antigravity-acp": HermesOverlay(
+        transport="codex_responses",
+        auth_type="external_process",
+        base_url_override="acp://antigravity",
+        base_url_env_var="HERMES_ANTIGRAVITY_ACP_BASE_URL",
+        extra_env_vars=("HERMES_ANTIGRAVITY_ACP_COMMAND",),
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -176,6 +183,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_override="https://integrate.api.nvidia.com/v1",
         base_url_env_var="NVIDIA_BASE_URL",
+    ),
+    "nvidia_nim": HermesOverlay(
+        transport="openai_chat",
+        base_url_override="https://integrate.api.nvidia.com/v1",
+        base_url_env_var="NVIDIA_BASE_URL",
+        extra_env_vars=("NVIDIA_API_KEY",),
     ),
     "xiaomi": HermesOverlay(
         transport="openai_chat",
@@ -284,6 +297,9 @@ ALIASES: Dict[str, str] = {
     "copilot": "github-copilot",
     "github": "github-copilot",
     "github-copilot-acp": "copilot-acp",
+    "antigravity": "antigravity-acp",
+    "agy": "antigravity-acp",
+    "gemini-acp": "antigravity-acp",
 
     # opencode (models.dev ID for OpenCode Zen)
     "opencode-zen": "opencode",
@@ -368,6 +384,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
+    "antigravity-acp": "Antigravity CLI (via ACP)",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",

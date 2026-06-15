@@ -2802,6 +2802,8 @@ def select_provider_and_model(args=None):
         _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
+    elif selected_provider == "antigravity-acp":
+        _model_flow_antigravity_acp(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
@@ -5372,6 +5374,67 @@ def _model_flow_copilot_acp(config, current_model=""):
         )
         or selected
     )
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
+def _model_flow_antigravity_acp(config, current_model=""):
+    """Antigravity CLI ACP flow using the local agy CLI."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        _get_antigravity_acp_auth_status,
+    )
+    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.config import load_config, save_config
+
+    del config
+
+    provider_id = "antigravity-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = _get_antigravity_acp_auth_status()
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or "agy"
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Antigravity CLI ACP delegates Hermes turns to `agy_acp_bridge.py`.")
+    print("  Hermes uses your selected model as a hint for the Antigravity ACP session.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    model_list = _PROVIDER_MODELS.get("antigravity-acp", [])
+    if model_list:
+        selected = _prompt_model_selection(
+            model_list,
+            current_model=current_model,
+        )
+    else:
+        try:
+            selected = input("Model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if not selected:
+        print("No change.")
+        return
+
     _save_model_choice(selected)
 
     cfg = load_config()

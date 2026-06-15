@@ -1089,7 +1089,9 @@ def test_run_conversation_codex_tool_round_trip(monkeypatch):
     responses = [_codex_tool_call_response(), _codex_message_response("done")]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count=None
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1727,7 +1729,7 @@ def test_run_conversation_codex_continues_after_ack_stop_message(monkeypatch):
     )
     assert any(
         msg.get("role") == "user"
-        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+            and "Continue now, execute the required work" in (msg.get("content") or "")
         for msg in result["messages"]
     )
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
@@ -1744,7 +1746,9 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     ]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count=None
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1768,7 +1772,7 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     )
     assert any(
         msg.get("role") == "user"
-        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+            and "Continue now, execute the required work" in (msg.get("content") or "")
         for msg in result["messages"]
     )
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])

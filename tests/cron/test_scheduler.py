@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -501,8 +502,8 @@ class TestDeliverResultWrapping:
         )
         return media_file.resolve()
 
-    def test_delivery_wraps_content_with_header_and_footer(self):
-        """Delivered content should include task name header and agent-invisible note."""
+    def test_delivery_wraps_content_with_body_first_and_compact_metadata(self):
+        """Delivered content should put the useful body before compact metadata."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -522,11 +523,12 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert sent_content.startswith("Here is today's summary.")
+        assert "任务：daily-report（ID: test-job）" in sent_content
+        assert "管理：回复 `stop reminder daily-report` 可停止。" in sent_content
+        assert "Cronjob Response" not in sent_content
+        assert "-------------" not in sent_content
+        assert "To stop or manage this job" not in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -547,7 +549,8 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert "任务：abc-123（ID: abc-123）" in sent_content
+        assert sent_content.startswith("Output.")
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -868,6 +871,207 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_run_job_uses_model_selection_alias_for_cron_runtime(self, tmp_path):
+        """Cron jobs without a pinned model should share the registry selector path."""
+        (tmp_path / "config.yaml").write_text(
+            "model_selection:\n"
+            "  selected_model_alias: codex-business-5.4-mini\n"
+            "  max_fallback_candidates: 3\n"
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  model: gpt-5.4-mini\n"
+            "fallback_providers:\n"
+            "- provider: volcengine-coding-plan\n"
+            "  model: ark-code-latest\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "registry-cron-job",
+            "name": "registry cron",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        from agent.model_registry import get_model_by_alias
+
+        selected_entry = get_model_by_alias("codex-business-5.4-mini")
+        fallback_entry = get_model_by_alias("codex-plus-5.4-mini")
+        assert selected_entry is not None
+        assert fallback_entry is not None
+        runtime_calls = []
+
+        def fake_resolve_runtime_provider(**kwargs):
+            runtime_calls.append(kwargs)
+            return {
+                "api_key": "codex-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "provider": kwargs.get("requested"),
+                "api_mode": "codex_responses",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "agent.model_selector.select_model_with_reason",
+                 return_value=SimpleNamespace(
+                     entry=selected_entry,
+                     reason="selected for cron",
+                     skipped=[],
+                 ),
+             ), \
+             patch(
+                 "agent.model_selector.build_fallback_chain",
+                 return_value=[selected_entry, fallback_entry],
+             ), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 side_effect=fake_resolve_runtime_provider,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        assert runtime_calls == [
+            {
+                "requested": "openai-codex",
+                "target_model": "gpt-5.4-mini",
+            }
+        ]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.4-mini"
+        assert kwargs["provider"] == "openai-codex"
+        assert kwargs["api_mode"] == "codex_responses"
+        assert kwargs["codex_home"] == "/home/lighthouse/.codex-business"
+        assert mock_agent.codex_home == "/home/lighthouse/.codex-business"
+
+        fallback_model = kwargs["fallback_model"]
+        assert fallback_model == [
+            {
+                "provider": "volcengine-coding-plan",
+                "model": "ark-code-latest",
+            },
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "alias": "codex-plus-5.4-mini",
+                "quota_family": "codex_plus",
+                "codex_home": "/home/lighthouse/.codex-plus",
+                "codex_account": "plus",
+            }
+        ]
+
+    def test_run_job_reads_model_model_written_by_global_model_command(self, tmp_path):
+        """Regression: /model --global writes model.model, not only model.default."""
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openrouter\n"
+            "  model: gpt-4o-mini-cron-model-key\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "model-model-job",
+            "name": "model.model cron",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["model"] == "gpt-4o-mini-cron-model-key"
+
+    def test_explicit_cron_route_appends_registry_fallbacks(self, tmp_path):
+        """A pinned cron route must continue past configured Gemini on 429."""
+        (tmp_path / "config.yaml").write_text(
+            "fallback_providers:\n"
+            "- provider: volcengine-coding-plan\n"
+            "  model: ark-code-latest\n"
+            "- provider: gemini\n"
+            "  model: gemini-flash-latest\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "explicit-registry-fallback-job",
+            "name": "explicit registry fallback",
+            "prompt": "hello",
+            "provider": "volcengine-coding-plan",
+            "model": "ark-code-latest",
+        }
+        fake_db = MagicMock()
+
+        from agent.model_registry import get_model_by_alias
+
+        registry_fallback = get_model_by_alias("nv-fallback")
+        assert registry_fallback is not None
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "agent.model_selector.build_fallback_chain",
+                 return_value=[registry_fallback],
+             ), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://ark.example.invalid/api/coding/v3",
+                     "provider": "custom",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["fallback_model"] == [
+            {
+                "provider": "gemini",
+                "model": "gemini-flash-latest",
+            },
+            {
+                "provider": "nvidia_nim",
+                "model": "deepseek-ai/deepseek-v4-flash",
+                "alias": "nv-fallback",
+                "quota_family": "nvidia_nim",
+            },
+        ]
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",

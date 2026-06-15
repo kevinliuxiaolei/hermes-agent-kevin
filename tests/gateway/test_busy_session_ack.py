@@ -188,6 +188,28 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+    async def test_telegram_text_defaults_to_queue_even_when_global_mode_interrupts(self):
+        from gateway.config import Platform
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = _make_event(text="补充一个要求")
+        event.source.platform = Platform.TELEGRAM
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        assert sk in adapter._pending_messages
+        agent.interrupt.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+
+    @pytest.mark.asyncio
     async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):
         """busy_text_mode=queue lets the adapter debounce text silently."""
         runner, sentinel = _make_runner()

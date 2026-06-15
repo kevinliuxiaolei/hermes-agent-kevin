@@ -91,6 +91,11 @@ def resolve_footer_config(
 def format_runtime_footer(
     *,
     model: Optional[str],
+    requested_model: Optional[str] = None,
+    requested_alias: Optional[str] = None,
+    executed_model: Optional[str] = None,
+    executed_alias: Optional[str] = None,
+    executed_slot: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -102,11 +107,27 @@ def format_runtime_footer(
     partially-populated footer is better than a line with ``?%`` or empty slots.
     """
     parts: list[str] = []
+
+    def _label(model_value: Optional[str], alias_value: Optional[str]) -> str:
+        if alias_value:
+            return alias_value
+        return _model_short(model_value)
+
     for field in fields:
         if field == "model":
-            m = _model_short(model)
-            if m:
-                parts.append(m)
+            requested_label = _label(requested_model, requested_alias)
+            executed_label = _label(executed_model or model, executed_alias)
+            if requested_label and executed_label:
+                if requested_label == executed_label:
+                    parts.append(executed_label)
+                else:
+                    parts.append(f"req:{requested_label} -> run:{executed_label}")
+            else:
+                label = executed_label or requested_label
+                if label:
+                    parts.append(label)
+            if executed_slot and parts:
+                parts[-1] = f"{parts[-1]}@{executed_slot}"
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
@@ -127,6 +148,11 @@ def build_footer_line(
     user_config: dict[str, Any] | None,
     platform_key: str | None,
     model: Optional[str],
+    requested_model: Optional[str] = None,
+    requested_alias: Optional[str] = None,
+    executed_model: Optional[str] = None,
+    executed_alias: Optional[str] = None,
+    executed_slot: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -142,6 +168,11 @@ def build_footer_line(
         return ""
     return format_runtime_footer(
         model=model,
+        requested_model=requested_model,
+        requested_alias=requested_alias,
+        executed_model=executed_model,
+        executed_alias=executed_alias,
+        executed_slot=executed_slot,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,

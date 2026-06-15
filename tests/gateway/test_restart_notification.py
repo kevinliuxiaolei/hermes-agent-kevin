@@ -239,6 +239,81 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
     assert home.thread_id == "topic-7"
 
 
+# ── startup lifecycle notifications ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_lifecycle_notifies_home_without_planned_marker(tmp_path, monkeypatch):
+    """Crash/SIGKILL recovery has no marker files but should still say online."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    await runner._send_startup_lifecycle_notifications()
+
+    adapter.send.assert_called_once_with(
+        "home-42",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
+    assert not (tmp_path / ".restart_pending.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_startup_lifecycle_skips_duplicate_home_when_restart_target_matches(
+    tmp_path, monkeypatch
+):
+    """A /restart in the home chat gets one precise restart reply, not two."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "home-42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="restart"))
+
+    await runner._send_startup_lifecycle_notifications()
+
+    adapter.send.assert_called_once()
+    assert "Gateway restarted successfully" in adapter.send.call_args.args[1]
+    assert not (tmp_path / ".restart_notify.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_startup_lifecycle_clears_planned_marker_after_home_notification(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_pending.json").write_text("{}")
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    await runner._send_startup_lifecycle_notifications()
+
+    adapter.send.assert_called_once_with(
+        "home-42",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
+    assert not (tmp_path / ".restart_pending.json").exists()
+
+
 # ── home-channel startup notifications ─────────────────────────────────────
 
 

@@ -1,0 +1,5 @@
+name: volcano-provider
+kind: model-provider
+version: 1.0.0
+description: Volcano Engine (Ark) LLM Provider
+author: Nous Research

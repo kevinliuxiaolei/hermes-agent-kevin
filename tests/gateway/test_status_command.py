@@ -175,6 +175,37 @@ async def test_status_command_tokens_zero_when_session_db_row_missing():
 
 
 @pytest.mark.asyncio
+async def test_status_command_explains_running_phase_and_route():
+    session_key = build_session_key(_make_source())
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[session_key] = SimpleNamespace(
+        get_activity_summary=lambda: {
+            "phase": "model_wait",
+            "provider": "antigravity-acp",
+            "model": "models/gemini-flash-latest",
+            "route_attempt": 2,
+            "route_total": 6,
+            "last_activity_desc": "waiting for provider response",
+            "seconds_since_activity": 42,
+        }
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Phase: model_wait" in result
+    assert "antigravity-acp / models/gemini-flash-latest (2/6)" in result
+    assert "Last meaningful activity: waiting for provider response (42s ago)" in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(
@@ -278,7 +309,7 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
 
     result = await runner._handle_message(_make_event("hello"))
 
-    assert result == "ok"
+    assert result.startswith("ok")
     runner.session_store.update_session.assert_called_once_with(
         session_entry.session_key,
         last_prompt_tokens=80,
@@ -322,7 +353,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
 
     result = await runner._handle_message(_make_event("hello", platform=Platform.SLACK))
 
-    assert result == "ok"
+    assert result.startswith("ok")
     runner.adapters[Platform.SLACK].send.assert_awaited_once()
     onboarding = runner.adapters[Platform.SLACK].send.await_args.args[1]
     assert "/hermes sethome" in onboarding
@@ -366,7 +397,7 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
 
     result = await runner._handle_message(_make_event("hello", platform=Platform.TELEGRAM))
 
-    assert result == "ok"
+    assert result.startswith("ok")
     runner.adapters[Platform.TELEGRAM].send.assert_awaited_once()
     onboarding = runner.adapters[Platform.TELEGRAM].send.await_args.args[1]
     assert "Type /sethome" in onboarding

@@ -2244,9 +2244,11 @@ def _normalize_chain_label(provider: str) -> str:
 
 
 def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+    """Mark ``provider`` as temporarily unhealthy, hidden from fallback chains.
+
+    Called after confirmed capacity failures such as payment/credit exhaustion
+    or provider-side overload. The cache is intentionally short-lived so a
+    topped-up or recovered provider becomes eligible again automatically.
     """
     label = _normalize_chain_label(provider)
     if not label:
@@ -2254,7 +2256,7 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+        "Auxiliary: marking %s unhealthy for %ds (capacity error). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
@@ -2388,6 +2390,44 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         )):
             return True
     return False
+
+
+def _is_transient_server_error(exc: Exception) -> bool:
+    """Detect provider-side 5xx/capacity errors that warrant fallback.
+
+    These are not local network failures, payment errors, or 429 rate limits,
+    but from the caller's perspective the selected route cannot currently
+    serve the auxiliary request. Gemini commonly surfaces overload as
+    HTTP 503 / UNAVAILABLE; without treating that as recoverable, background
+    title generation can emit noisy warnings even though the registry fallback
+    chain has healthy alternatives.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 500 <= status <= 599:
+        return True
+    err_lower = str(exc).lower()
+    return any(kw in err_lower for kw in (
+        "http 500", "http 502", "http 503", "http 504",
+        "error code: 500", "error code: 502", "error code: 503", "error code: 504",
+        "internal server error", "bad gateway", "service unavailable",
+        "temporarily unavailable", "unavailable", "overloaded",
+        "model is overloaded", "provider overloaded",
+    ))
+
+
+def _is_aux_capacity_server_error(exc: Exception) -> bool:
+    """Detect overload/capacity failures, excluding generic HTTP 500 bugs."""
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status in {503, 529}:
+        return True
+    err_lower = str(exc).lower()
+    return any(kw in err_lower for kw in (
+        "http 503", "error code: 503", "http 529", "error code: 529",
+        "high demand", "resource exhausted", "service unavailable",
+        "temporarily unavailable", "model is overloaded", "provider overloaded",
+    ))
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -2977,6 +3017,115 @@ def _try_main_agent_model_fallback(
         task or "call", reason, failed_provider, label, resolved_model or main_model,
     )
     return client, resolved_model or main_model, label
+
+
+def _try_registry_fallback_chain(
+    task: str,
+    failed_provider: str,
+    failed_model: Optional[str] = None,
+    reason: str = "error",
+    *,
+    preferred_alias: Optional[str] = None,
+    max_candidates: int = 4,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try the unified model-selector fallback chain for auxiliary calls.
+
+    This keeps short auxiliary tasks such as title generation aligned with
+    the same quota-aware route order used by Telegram/chat.  The failed
+    provider/model pair is skipped so a transient 5xx on the selected route
+    immediately advances to the next healthy registry route.
+    """
+    try:
+        from agent.model_registry import get_model_by_alias
+        from agent.route_plan import build_route_plan
+    except Exception as exc:
+        logger.debug("Auxiliary %s: registry fallback unavailable: %s", task or "call", exc)
+        return None, None, ""
+
+    failed_provider_norm = (failed_provider or "").strip().lower()
+    failed_model_norm = (failed_model or "").strip()
+    tried = []
+    try:
+        route_task = {
+            "compression": "summary",
+            "title_generation": "light",
+            "web_extract": "light",
+        }.get(task or "", task or "light")
+        plan = build_route_plan(
+            task=route_task,
+            max_candidates=max_candidates,
+            preferred_alias=preferred_alias,
+        )
+    except Exception as exc:
+        logger.debug("Auxiliary %s: registry fallback chain build failed: %s", task or "call", exc)
+        return None, None, ""
+
+    if task == "compression":
+        candidates = [
+            str(route.get("alias") or route.get("provider") or "unknown")
+            for route in plan.fallbacks
+        ]
+        skipped = [
+            f"{item.get('route', 'unknown')} ({item.get('reason', 'skipped')})"
+            for item in plan.skipped
+        ]
+        logger.info(
+            "Auxiliary compression RoutePlan: candidates=[%s] skipped=[%s]",
+            ", ".join(candidates) or "none",
+            ", ".join(skipped) or "none",
+        )
+
+    for route in plan.fallbacks:
+        fb_provider = str(route.get("provider") or "").strip()
+        fb_model = str(route.get("model") or "").strip()
+        fb_alias = str(route.get("alias") or "").strip()
+        entry = get_model_by_alias(fb_alias) if fb_alias else None
+        if not fb_provider or not fb_model:
+            continue
+        if (fb_provider.lower() == failed_provider_norm and (not failed_model_norm or fb_model == failed_model_norm)):
+            tried.append(f"{fb_alias or fb_provider} (failed route)")
+            continue
+        if _is_provider_unhealthy(fb_provider):
+            _log_skip_unhealthy(fb_provider, task)
+            tried.append(f"{fb_alias or fb_provider} (unhealthy)")
+            continue
+        old_codex_home = os.environ.get("CODEX_HOME")
+        old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+        codex_home = str(route.get("codex_home") or "").strip()
+        if codex_home:
+            os.environ["CODEX_HOME"] = codex_home
+            os.environ["HERMES_CODEX_HOME"] = codex_home
+        try:
+            client, resolved_model = resolve_provider_client(fb_provider, fb_model)
+        except Exception as exc:
+            logger.debug("Auxiliary %s: registry fallback %s failed to resolve: %s", task or "call", fb_alias or fb_provider, exc)
+            client, resolved_model = None, None
+        finally:
+            if codex_home:
+                if old_codex_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex_home
+                if old_hermes_codex_home is None:
+                    os.environ.pop("HERMES_CODEX_HOME", None)
+                else:
+                    os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
+        if client is not None:
+            label = fb_alias or fb_provider
+            logger.info(
+                "Auxiliary %s: %s on %s — registry fallback to %s (%s)",
+                task or "call", reason, failed_provider, label, resolved_model or fb_model,
+            )
+            return client, resolved_model or fb_model, label
+        tried.append(fb_alias or fb_provider)
+
+    if tried:
+        log = logger.warning if task == "compression" else logger.debug
+        log(
+            "Auxiliary %s: registry fallback chain exhausted (tried: %s)",
+            task or "call", ", ".join(tried),
+        )
+    return None, None, ""
 
 
 def _try_configured_fallback_chain(
@@ -3820,21 +3969,21 @@ def resolve_provider_client(
             or _read_main_model(),
             provider,
         )
-        if provider == "copilot-acp":
+        if provider in {"copilot-acp", "antigravity-acp"}:
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             if not final_model:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured", provider
                 )
                 return None, None
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
+                    "resolve_provider_client: %s requested but external "
+                    "process credentials are incomplete", provider
                 )
                 return None, None
             from agent.copilot_acp_client import CopilotACPClient
@@ -4956,6 +5105,48 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _get_selected_model_alias_for_auxiliary() -> Optional[str]:
+    """Return the user-selected model alias from config, if present."""
+    try:
+        from hermes_cli.config import load_config
+        from agent.model_selector import get_selected_alias_from_config
+
+        cfg = load_config() or {}
+        if isinstance(cfg, dict):
+            return get_selected_alias_from_config(cfg)
+    except Exception as exc:
+        logger.debug("Auxiliary: could not read selected model alias: %s", exc)
+    return None
+
+
+def _select_registry_route_for_auxiliary(task: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Select the default registry route for an auto auxiliary task.
+
+    Uses task=chat deliberately: title generation should follow the same
+    Telegram/chat default route instead of a separate cheap aux default.
+    """
+    preferred_alias = _get_selected_model_alias_for_auxiliary()
+    try:
+        from agent.model_selector import select_model_with_reason
+
+        selection = select_model_with_reason(
+            task="chat",
+            preferred_alias=preferred_alias,
+            refresh_quota=False,
+        )
+        entry = selection.entry
+    except Exception as exc:
+        logger.debug("Auxiliary %s: model selector route failed: %s", task or "call", exc)
+        return None, None, preferred_alias
+    if not entry:
+        return None, None, preferred_alias
+    return (
+        str(getattr(entry, "provider", "") or "").strip() or None,
+        str(getattr(entry, "model", "") or "").strip() or None,
+        str(getattr(entry, "alias", "") or "").strip() or preferred_alias,
+    )
+
+
 def call_llm(
     task: str = None,
     *,
@@ -5025,6 +5216,19 @@ def call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
+        selected_alias = None
+        if (
+            task == "title_generation"
+            and resolved_provider == "auto"
+            and not resolved_model
+            and not resolved_base_url
+            and provider is None
+            and model is None
+        ):
+            route_provider, route_model, selected_alias = _select_registry_route_for_auxiliary(task)
+            if route_provider and route_model:
+                resolved_provider = route_provider
+                resolved_model = route_model
         client, final_model = _get_cached_client(
             resolved_provider,
             resolved_model,
@@ -5106,6 +5310,7 @@ def call_llm(
                 if not (
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
+                    or _is_transient_server_error(retry_err)
                     or _is_auth_error(retry_err)
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
@@ -5138,7 +5343,12 @@ def call_llm(
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or _is_transient_server_error(retry_err)
+                ):
                     raise
                 first_err = retry_err
 
@@ -5204,6 +5414,7 @@ def call_llm(
                         or _is_payment_error(retry_err)
                         or _is_connection_error(retry_err)
                         or _is_rate_limit_error(retry_err)
+                        or _is_transient_server_error(retry_err)
                     ):
                         raise
                     first_err = retry_err
@@ -5328,6 +5539,8 @@ def call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or (task == "title_generation" and _is_transient_server_error(first_err))
+            or (task in {"compression", "web_extract"} and _is_aux_capacity_server_error(first_err))
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -5338,7 +5551,12 @@ def call_llm(
         is_auto = resolved_provider in {"auto", "", None}
         # Capacity errors bypass the explicit-provider gate: the provider
         # literally cannot serve this request regardless of user intent.
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
+        is_capacity_error = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or (task == "title_generation" and _is_transient_server_error(first_err))
+            or (task in {"compression", "web_extract"} and _is_aux_capacity_server_error(first_err))
+        )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_payment_error(first_err):
                 reason = "payment error"
@@ -5351,6 +5569,11 @@ def call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_transient_server_error(first_err):
+                reason = "server error"
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
+                )
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -5367,8 +5590,17 @@ def call_llm(
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                if task in {"compression", "title_generation", "web_extract"}:
+                    fb_client, fb_model, fb_label = _try_registry_fallback_chain(
+                        task,
+                        resolved_provider or "auto",
+                        failed_model=final_model,
+                        reason=reason,
+                        preferred_alias=locals().get("selected_alias"),
+                    )
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                        task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)

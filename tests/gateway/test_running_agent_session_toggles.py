@@ -168,6 +168,31 @@ async def test_reasoning_rejected_mid_run():
 
 
 @pytest.mark.asyncio
+async def test_model_list_dispatches_read_only_mid_run():
+    runner = _make_runner()
+    runner._handle_model_command = AsyncMock(return_value="模型清单")
+
+    result = await runner._handle_message(_make_event("/model list"))
+
+    runner._handle_model_command.assert_awaited_once()
+    assert runner._handle_model_command.await_args.kwargs["read_only"] is True
+    assert result == "模型清单"
+
+
+@pytest.mark.asyncio
+async def test_model_switch_rejected_mid_run():
+    runner = _make_runner()
+    runner._handle_model_command = AsyncMock(
+        side_effect=AssertionError("model switch must not dispatch mid-run")
+    )
+
+    result = await runner._handle_message(_make_event("/model gemini-low"))
+
+    runner._handle_model_command.assert_not_awaited()
+    assert "wait or /stop first" in result
+
+
+@pytest.mark.asyncio
 async def test_btw_dispatches_mid_run():
     """/btw mid-run must dispatch to /background's handler, not hit the catch-all.
 

@@ -249,3 +249,47 @@ class TestTelegramModelPicker:
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+
+    @pytest.mark.asyncio
+    async def test_registry_picker_keeps_auto_checkmark_when_provider_model_matches_fixed_alias(self, monkeypatch):
+        import gateway.platforms.telegram as tg
+
+        sent = {}
+
+        class _RecordingButton:
+            def __init__(self, text, callback_data=None, **kwargs):
+                self.text = text
+                self.callback_data = callback_data
+
+        class _RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _RecordingButton)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _RecordingMarkup)
+
+        adapter = _make_adapter()
+
+        async def mock_send_message(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=101)
+
+        adapter._bot.send_message = AsyncMock(side_effect=mock_send_message)
+
+        result = await adapter.send_model_picker(
+            chat_id="12345",
+            providers=[],
+            current_model="ark-code-latest",
+            current_provider="volcengine-agent-plan",
+            session_key="s",
+            on_model_selected=AsyncMock(),
+            metadata=None,
+            display_text="<pre>额度概览</pre>",
+            current_alias="auto",
+        )
+
+        assert result.success is True
+        labels = [button.text for row in sent["reply_markup"].inline_keyboard for button in row]
+        assert labels[0] == "✓ 自动模式"
+        assert "✓ Ark Agent" not in labels

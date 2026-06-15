@@ -3147,6 +3147,15 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._try_registry_fallback_chain",
+                return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
@@ -3586,3 +3595,22 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+
+def test_compression_registry_fallback_logs_route_plan_and_exhaustion(caplog):
+    from types import SimpleNamespace
+    from agent.auxiliary_client import _try_registry_fallback_chain
+
+    plan = SimpleNamespace(
+        fallbacks=[{"alias": "gemini-low", "provider": "antigravity-acp", "model": "gemini"}],
+        skipped=[{"route": "codex-plus-5.5", "reason": "auth"}],
+    )
+    with patch("agent.route_plan.build_route_plan", return_value=plan), \
+         patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
+         caplog.at_level("INFO", logger="agent.auxiliary_client"):
+        result = _try_registry_fallback_chain("compression", "gemini")
+
+    assert result == (None, None, "")
+    messages = [record.message for record in caplog.records]
+    assert any("Auxiliary compression RoutePlan" in message and "codex-plus-5.5 (auth)" in message for message in messages)
+    assert any("registry fallback chain exhausted" in message for message in messages)

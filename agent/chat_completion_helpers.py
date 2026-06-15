@@ -841,7 +841,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # API replay, session transcript, gateway delivery, CLI display,
     # compression, title generation.
     if isinstance(_san_content, str) and _san_content:
-        _san_content = agent._strip_think_blocks(_san_content).strip()
+        _stripped = agent._strip_think_blocks(_san_content).strip()
+        if _stripped:
+            _san_content = _stripped
+        else:
+            # Preserve original content if stripping removes everything
+            _san_content = _san_content
 
     # Defence-in-depth: redact credentials (PATs, API keys, Bearer tokens)
     # from assistant content BEFORE the message enters conversation history.
@@ -853,6 +858,9 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if isinstance(_san_content, str) and _san_content:
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
+        # Ensure the content is non-empty for API validation when there are no tool calls
+        if not _san_content and not assistant_tool_calls:
+            _san_content = " "
 
     msg = {
         "role": "assistant",
@@ -1030,8 +1038,41 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     agent._fallback_index += 1
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
+    fb_codex_home = (fb.get("codex_home") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback()  # skip invalid, try next
+    try:
+        from agent.route_health import route_health_allows
+        allowed, health_reason = route_health_allows(fb_provider)
+        if not allowed:
+            logger.warning(
+                "Fallback skip: provider %s blocked by runtime health: %s",
+                fb_provider,
+                health_reason,
+            )
+            return agent._try_activate_fallback()
+    except Exception:
+        pass
+
+    if fb_provider == "nvidia_nim":
+        fb_alias = fb.get("alias")
+        if hasattr(agent, "_attempted_aliases") and fb_alias in agent._attempted_aliases:
+            logger.warning("Guard: skipping duplicate attempt on nvidia alias: %s", fb_alias)
+            return agent._try_activate_fallback()
+        nvidia_attempts = getattr(agent, "_nvidia_attempts_count", 0)
+        if nvidia_attempts >= 2:
+            logger.warning("Guard: maximum 2 attempts reached for nvidia_nim provider")
+            return agent._try_activate_fallback()
+
+    if fb_provider == "gemini":
+        fb_alias = fb.get("alias")
+        if hasattr(agent, "_attempted_aliases") and fb_alias in agent._attempted_aliases:
+            logger.warning("Guard: skipping duplicate attempt on gemini alias: %s", fb_alias)
+            return agent._try_activate_fallback()
+        gemini_attempts = getattr(agent, "_gemini_attempts_count", 0)
+        if gemini_attempts >= 2:
+            logger.warning("Guard: maximum 2 attempts reached for gemini provider")
+            return agent._try_activate_fallback()
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
@@ -1080,10 +1121,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
-        fb_client, _resolved_fb_model = resolve_provider_client(
-            fb_provider, model=fb_model, raw_codex=True,
-            explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+        old_codex_home = os.environ.get("CODEX_HOME")
+        old_hermes_codex_home = os.environ.get("HERMES_CODEX_HOME")
+        if fb_codex_home and fb_provider == "openai-codex":
+            os.environ["CODEX_HOME"] = fb_codex_home
+            os.environ["HERMES_CODEX_HOME"] = fb_codex_home
+        try:
+            fb_client, _resolved_fb_model = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_hint,
+                explicit_api_key=fb_api_key_hint)
+        finally:
+            if fb_codex_home and fb_provider == "openai-codex":
+                if old_codex_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex_home
+                if old_hermes_codex_home is None:
+                    os.environ.pop("HERMES_CODEX_HOME", None)
+                else:
+                    os.environ["HERMES_CODEX_HOME"] = old_hermes_codex_home
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",
@@ -1137,9 +1194,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        agent._touch_activity(f"switching to fallback route: {fb_provider}/{fb_model}")
+        if fb_codex_home:
+            agent.codex_home = fb_codex_home
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        if fb_provider == "nvidia_nim":
+            if not hasattr(agent, "_attempted_aliases"):
+                agent._attempted_aliases = set()
+            agent._attempted_aliases.add(fb.get("alias"))
+            agent._nvidia_attempts_count = getattr(agent, "_nvidia_attempts_count", 0) + 1
+        elif fb_provider == "gemini":
+            if not hasattr(agent, "_attempted_aliases"):
+                agent._attempted_aliases = set()
+            agent._attempted_aliases.add(fb.get("alias"))
+            agent._gemini_attempts_count = getattr(agent, "_gemini_attempts_count", 0) + 1
 
         # Clear the credential pool when the fallback provider doesn't match
         # the pool's provider.  The pool was seeded for the primary provider;
@@ -1198,6 +1268,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "base_url": fb_base_url,
                 **({"default_headers": dict(fb_headers)} if fb_headers else {}),
             }
+            if hasattr(fb_client, "_acp_command"):
+                agent._client_kwargs["command"] = fb_client._acp_command
+            if hasattr(fb_client, "_acp_args"):
+                agent._client_kwargs["args"] = fb_client._acp_args
+            if hasattr(fb_client, "_acp_cwd"):
+                agent._client_kwargs["acp_cwd"] = fb_client._acp_cwd
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
                 # Rebuild the shared OpenAI client so the configured

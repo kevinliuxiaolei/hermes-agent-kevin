@@ -202,6 +202,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    **kwargs,
 ):
     """
     Initialize the AI Agent.
@@ -254,6 +255,7 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    agent.codex_home = kwargs.get("codex_home")
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
@@ -356,8 +358,8 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and agent.provider not in {"copilot-acp", "antigravity-acp"}
+        and not str(agent.base_url or "").lower().startswith("acp://")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
@@ -504,6 +506,7 @@ def init_agent(
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
     agent._last_activity_desc: str = "initializing"
+    agent._activity_phase: str = "routing"
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
 
@@ -721,7 +724,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            if agent.provider in {"copilot-acp", "antigravity-acp"}:
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
@@ -767,6 +770,12 @@ def init_agent(
                     "api_key": _routed_client.api_key,
                     "base_url": str(_routed_client.base_url),
                 }
+                if hasattr(_routed_client, "_acp_command"):
+                    client_kwargs["command"] = _routed_client._acp_command
+                if hasattr(_routed_client, "_acp_args"):
+                    client_kwargs["args"] = _routed_client._acp_args
+                if hasattr(_routed_client, "_acp_cwd"):
+                    client_kwargs["acp_cwd"] = _routed_client._acp_cwd
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
                 # Preserve provider-specific headers the router set.  The
@@ -824,6 +833,12 @@ def init_agent(
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
                             }
+                            if hasattr(_fb_client, "_acp_command"):
+                                client_kwargs["command"] = _fb_client._acp_command
+                            if hasattr(_fb_client, "_acp_args"):
+                                client_kwargs["args"] = _fb_client._acp_args
+                            if hasattr(_fb_client, "_acp_cwd"):
+                                client_kwargs["acp_cwd"] = _fb_client._acp_cwd
                             if _provider_timeout is not None:
                                 client_kwargs["timeout"] = _provider_timeout
                             _fb_headers = getattr(_fb_client, "_custom_headers", None)
