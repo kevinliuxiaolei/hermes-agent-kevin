@@ -100,6 +100,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # suffixes of other words (e.g. "skill" -> "kill").
     r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
     r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:hermes[_-]release\.sh\s+(?:prepare|promote|rollback)\b)"
 )
 
 

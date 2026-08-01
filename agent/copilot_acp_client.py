@@ -529,6 +529,13 @@ class CopilotACPClient:
             timeout_seconds=_effective_timeout,
         )
 
+        if not str(response_text or "").strip() and not str(reasoning_text or "").strip():
+            raise RuntimeError(
+                "ACP session/prompt returned an empty response. This usually means "
+                "the external provider hit a quota/usage limit, timed out, or exited "
+                "without producing output."
+            )
+
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
         usage = SimpleNamespace(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -41,6 +42,11 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
 
 
 def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
     if isinstance(raw, dict):
         candidates = [raw]
     elif isinstance(raw, list):

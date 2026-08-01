@@ -12,13 +12,36 @@ Those stay on AIAgent.
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # Sentinel for "omit temperature entirely" (Kimi: server manages it)
 OMIT_TEMPERATURE = object()
+
+
+@dataclass(frozen=True)
+class ExternalProcessSpec:
+    """Resolved command description for an external process."""
+    provider: str
+    command: str
+    args: tuple[str, ...] = ()
+    base_url: str = ""
+    api_key: str = ""
+
+
+def _split_env_args(value: str) -> tuple[str, ...]:
+    if not value.strip():
+        return ()
+    try:
+        return tuple(shlex.split(value))
+    except ValueError:
+        return tuple(value.split())
 
 
 def _profile_user_agent() -> str:
@@ -55,6 +78,14 @@ class ProviderProfile:
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
+
+    # Declarative metadata for ACP/local bridge providers.
+    command_env_vars: tuple[str, ...] = ()
+    args_env_var: str = ""
+    base_url_env_var: str = ""
+    default_command: str = ""
+    default_args: tuple[str, ...] = ()
+    expose_in_picker: bool = False
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
@@ -98,6 +129,44 @@ class ProviderProfile:
         ""  # cheap model for auxiliary tasks (compression, vision, etc.)
     )
     # empty = use main model
+
+    def resolve_external_process(self) -> ExternalProcessSpec | None:
+        """Resolve this profile's declared external process."""
+        if self.auth_type != "external_process":
+            return None
+        command = ""
+        for env_name in self.command_env_vars:
+            command = os.getenv(env_name, "").strip()
+            if command:
+                break
+        command = command or self.default_command
+        if not command:
+            return None
+        resolved = command if "/" in command else shutil.which(command)
+        if not resolved:
+            home = os.getenv("HERMES_HOME", "").strip()
+            if home and (Path(home) / "bin" / command).is_file():
+                resolved = str(Path(home) / "bin" / command)
+        if not resolved:
+            try:
+                from hermes_constants import get_hermes_home
+                candidate = get_hermes_home() / "bin" / command
+                if candidate.is_file():
+                    resolved = str(candidate)
+            except Exception:
+                pass
+        resolved = resolved or command
+        raw_args = os.getenv(self.args_env_var, "") if self.args_env_var else ""
+        args = _split_env_args(raw_args) if raw_args.strip() else tuple(self.default_args)
+        base_url = os.getenv(self.base_url_env_var, "").strip() if self.base_url_env_var else ""
+        return ExternalProcessSpec(
+            provider=self.name, command=resolved, args=args,
+            base_url=base_url or self.base_url, api_key=self.name,
+        )
+
+    def model_context_length(self, model: str) -> int | None:
+        """Return a provider-declared context window, if known."""
+        return None
 
     # ── Hooks (override in subclass for complex providers) ───
 
