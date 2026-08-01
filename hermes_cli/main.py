@@ -9836,6 +9836,24 @@ def cmd_update(args):
         )
         return
 
+    try:
+        from hermes_cli.config import load_config as _load_update_config
+        _launcher = (_load_update_config() or {}).get("updates", {}).get("external_launcher", "")
+        _launcher_cmd = (
+            [str(part) for part in _launcher if str(part).strip()]
+            if isinstance(_launcher, (list, tuple))
+            else shlex.split(str(_launcher)) if str(_launcher).strip() else []
+        )
+        if _launcher_cmd:
+            print("⚕ Preparing an immutable Hermes release candidate...")
+            _result = subprocess.run(_launcher_cmd, cwd=str(PROJECT_ROOT), check=False)
+            if _result.returncode:
+                sys.exit(_result.returncode)
+            return
+    except Exception as exc:
+        logger.warning("External update launcher failed: %s", exc)
+        sys.exit(1)
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate

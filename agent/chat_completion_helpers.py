@@ -2490,6 +2490,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 
+    try:
+        from agent.route_health import is_route_blocked
+        route_block = is_route_blocked(fb_provider, fb_model)
+    except Exception:
+        route_block = None
+    if route_block and route_block.blocked:
+        logger.warning(
+            "Fallback skip: %s/%s blocked by route health: %s",
+            fb_provider, fb_model, route_block.reason,
+        )
+        return agent._try_activate_fallback(reason)
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)

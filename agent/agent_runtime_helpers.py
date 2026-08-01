@@ -2483,9 +2483,20 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    _external_profile = None
+    try:
+        from providers import get_provider_profile
+        _external_profile = get_provider_profile(agent.provider)
+    except Exception:
+        _external_profile = None
+    if _external_profile and _external_profile.auth_type == "external_process":
         from agent.copilot_acp_client import CopilotACPClient
-
+        _external_spec = _external_profile.resolve_external_process()
+        if _external_spec:
+            client_kwargs.setdefault("api_key", _external_spec.api_key)
+            client_kwargs.setdefault("base_url", _external_spec.base_url)
+            client_kwargs.setdefault("command", _external_spec.command)
+            client_kwargs.setdefault("args", list(_external_spec.args))
         client = CopilotACPClient(**client_kwargs)
         _ra().logger.info(
             "Copilot ACP client created (%s, shared=%s) %s",

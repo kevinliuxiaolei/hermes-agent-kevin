@@ -79,6 +79,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # token orders because real reproductions show both.
     r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
     r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:hermes[_-]release\.sh\s+(?:prepare|promote|rollback)\b)"
 )
 
 

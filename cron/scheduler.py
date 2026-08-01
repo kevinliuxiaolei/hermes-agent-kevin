@@ -62,6 +62,23 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+def _filter_route_health_fallback_model(fallback_model):
+    """Drop blocked routes from this cron invocation only."""
+    if not fallback_model:
+        return fallback_model
+    try:
+        from agent.route_health import filter_usable_routes
+        usable, skipped = filter_usable_routes(fallback_model)
+        for entry in skipped:
+            logger.warning(
+                "Cron fallback route skipped: %s/%s (%s)",
+                entry.get("provider"), entry.get("model"), entry.get("skip_reason"),
+            )
+        return usable
+    except Exception:
+        return fallback_model
+
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
@@ -5039,6 +5056,17 @@ def run_job(
                 if not fb_provider or not fb_model:
                     continue
                 try:
+                    from agent.route_health import is_route_blocked
+                    blocked = is_route_blocked(fb_provider, fb_model)
+                except Exception:
+                    blocked = None
+                if blocked and blocked.blocked:
+                    logger.warning(
+                        "Job '%s': auth fallback skipped for %s/%s: %s",
+                        job_id, fb_provider, fb_model, blocked.reason,
+                    )
+                    continue
+                try:
                     from hermes_cli.fallback_config import resolve_entry_api_key
 
                     fb_kwargs = {
@@ -5163,7 +5191,7 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = _filter_route_health_fallback_model(get_fallback_chain(_cfg) or None)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

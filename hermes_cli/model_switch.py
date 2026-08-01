@@ -2690,9 +2690,15 @@ def list_authenticated_providers(
         if pid.lower() in _excluded or hermes_slug.lower() in _excluded:
             continue
 
-        # Check if credentials exist
+        # External-process providers authenticate through their command.
         has_creds = False
-        if overlay.auth_type == "aws_sdk":
+        if overlay.auth_type == "external_process":
+            try:
+                from hermes_cli.auth import get_external_process_provider_status
+                has_creds = bool(get_external_process_provider_status(hermes_slug).get("configured"))
+            except Exception:
+                has_creds = False
+        elif overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
         elif overlay.auth_type == "vertex":
             # Vertex authenticates via OAuth2 (service-account JSON / ADC),

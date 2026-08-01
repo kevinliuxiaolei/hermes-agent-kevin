@@ -757,11 +757,21 @@ def init_agent(
     # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
     # does NOT support the Responses API — skip the upgrade for Azure
     # (openai.azure.com), even though it looks OpenAI-compatible.
+    _external_process_provider = False
+    _external_profile = None
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+        _external_profile = _get_provider_profile(agent.provider)
+        _external_process_provider = bool(
+            _external_profile and _external_profile.auth_type == "external_process"
+        )
+    except Exception:
+        _external_process_provider = False
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and not _external_process_provider
+        and not str(agent.base_url or "").lower().startswith("acp://")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
@@ -1224,9 +1234,10 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
-                client_kwargs["command"] = agent.acp_command
-                client_kwargs["args"] = agent.acp_args
+            if _external_process_provider:
+                _spec = _external_profile.resolve_external_process() if _external_profile else None
+                client_kwargs["command"] = agent.acp_command or (_spec.command if _spec else None)
+                client_kwargs["args"] = agent.acp_args or (list(_spec.args) if _spec else [])
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
