@@ -795,6 +795,23 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body_from_profile:
             extra_body.update(extra_body_from_profile)
 
+        # Forward an explicit per-model reasoning override
+        # (agent.reasoning_overrides) for OpenAI-compatible providers whose
+        # profile does not emit reasoning itself. Skip providers with their
+        # own reasoning mechanism (Gemini thinking_config, GitHub, LM Studio,
+        # OpenRouter) — those handle it elsewhere and may reject this field.
+        _model_l = (model or "").strip().lower()
+        if (
+            reasoning_config
+            and not extra_body_from_profile
+            and not params.get("is_lmstudio", False)
+            and not params.get("is_github_models", False)
+            and not params.get("is_openrouter", False)
+            and not _model_l.startswith("gemini")
+        ):
+            _effort = reasoning_config.get("effort", "medium") or "medium"
+            extra_body.setdefault("reasoning", {"enabled": True, "effort": _effort})
+
         # Merge any pre-built extra_body additions from the caller
         additions = params.get("extra_body_additions")
         if additions:
