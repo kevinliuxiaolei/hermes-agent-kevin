@@ -433,6 +433,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "vertex": "Google Vertex AI",
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
+    "antigravity-acp": "AGY",
+    "volcengine-coding-plan": "Volc",
 }
 
 
