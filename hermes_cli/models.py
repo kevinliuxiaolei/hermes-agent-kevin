@@ -260,6 +260,13 @@ def _xai_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "moa": ["default"],
+    "antigravity-acp": [
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash-high",
+        "gemini-3.1-pro-high",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+    ],
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",
@@ -1307,6 +1314,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "volc":     ("Volcengine",      "Volc Coding Plan & Agent Plan (auto-routed)",       ["volcengine-coding-plan", "volcengine-agent-plan"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.

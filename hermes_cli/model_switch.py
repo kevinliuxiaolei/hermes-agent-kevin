@@ -3103,6 +3103,13 @@ def list_authenticated_providers(
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
                 if hermes_slug in _MODELS_DEV_PREFERRED:
                     model_ids = _merge_with_models_dev(hermes_slug, model_ids)
+            configured_models: list[str] = []
+            if isinstance(user_providers, dict):
+                configured = user_providers.get(hermes_slug) or user_providers.get(pid)
+                if isinstance(configured, dict):
+                    configured_models = _declared_model_ids(configured.get("models"))
+            if configured_models:
+                model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
         total = len(model_ids)
         if hermes_slug in _UNCAPPED_PICKER_PROVIDERS:
             top = model_ids  # Aggregator: show full catalog regardless of max_models

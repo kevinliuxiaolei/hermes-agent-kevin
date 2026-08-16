@@ -445,6 +445,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
     "opencode-free": "OpenCode Free",
+    "antigravity-acp": "AGY",
+    "volcengine-coding-plan": "Volc",
 }
 
 
