@@ -34,11 +34,83 @@ piecemeal, the footer is sent as a separate trailing message via
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+
+# Provider -> 简写 label. 长 key 在前（最长前缀优先），与 model_metadata 的
+# longest-key-first 约定一致。
+_PROVIDER_SHORT = (
+    ("volcengine-coding-plan", "coding"),
+    ("volcengine-agent-plan", "agent"),
+    ("volcengine-coding", "coding"),
+    ("volcengine-agent", "agent"),
+    ("antigravity-acp", "agy"),
+    ("agy", "agy"),
+    ("openai-codex", "codex"),
+    ("openai", "openai"),
+    ("anthropic", "claude"),
+    ("bedrock", "bedrock"),
+    ("moa", "moa"),
+    ("custom", "custom"),
+)
+
+
+def _provider_short(provider: Optional[str], base_url: Optional[str] = None) -> str:
+    """Map provider/base_url to a short label for the footer.
+
+    Resolves plan identity from base_url path even when the runtime provider
+    is reported as ``custom`` (Volc custom routes carry /api/coding/ or
+    /api/plan/ in the URL).
+    """
+    p = (provider or "").strip().lower()
+    b = (base_url or "").strip().lower()
+
+    if not p and not b:
+        return ""
+
+    # base_url 优先：custom 路由也能识别 plan
+    if "ark.cn-beijing.volces.com" in b:
+        if "/api/plan/" in b or "/api/plan" == b or b.rstrip("/").endswith("/api/plan"):
+            return "agent"
+        if "/api/coding/" in b or "/api/coding" == b or b.rstrip("/").endswith("/api/coding"):
+            return "coding"
+    if "acp://antigravity" in b:
+        return "agy"
+    if "chatgpt.com/backend-api/codex" in b or "openai.com" in b and "codex" in b:
+        return "codex"
+
+    for key, label in _PROVIDER_SHORT:
+        if p == key:
+            return label
+    # 子串兜底（如 custom:volcengine-coding-plan）
+    for key, label in _PROVIDER_SHORT:
+        if key in p:
+            return label
+    if p:
+        return p.split(":")[-1][:12]
+    return ""
+
+
+def _agy_account() -> str:
+    """Return the active Antigravity account (e.g. dirisephan@gmail.com)."""
+    try:
+        for path in (
+            os.path.expanduser("~/.gemini/google_accounts.json"),
+            os.path.expanduser("~/.config/agy/accounts.json"),
+        ):
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                active = d.get("active") if isinstance(d, dict) else None
+                if active:
+                    return str(active).split("@")[0]
+    except Exception:
+        pass
+    return ""
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -115,6 +187,8 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -128,6 +202,14 @@ def format_runtime_footer(
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "provider":
+            label = _provider_short(provider, base_url)
+            if label:
+                if label == "agy":
+                    acct = _agy_account()
+                    parts.append(f"agy({acct})" if acct else "agy")
+                else:
+                    parts.append(label)
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
@@ -157,6 +239,8 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -167,6 +251,10 @@ def build_footer_line(
     ``turn_seconds`` is the wall-clock duration of the agent run, measured by
     the caller with ``time.monotonic()``.  Callers that don't measure it leave
     it ``None`` and the ``latency`` field is skipped.
+
+    ``provider`` / ``base_url`` feed the ``provider`` short label (e.g.
+    ``agent`` / ``coding`` / ``agy(account)``); the base_url path identifies
+    the Volc plan even when the runtime provider resolves to ``custom``.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
@@ -177,5 +265,7 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        provider=provider,
+        base_url=base_url,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

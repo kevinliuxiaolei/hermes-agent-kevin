@@ -77,6 +77,37 @@ def _ra():
     return run_agent
 
 
+def _refined_provider_label(agent: Any) -> str:
+    """Render a readable short label for the session ``Provider:`` identity.
+
+    Named custom endpoints (``volcengine-agent-plan``, ``volcengine-coding-plan``,
+    ``antigravity-acp``, ...) resolve their runtime provider to the opaque key
+    ``custom``, which tells the model nothing about the actual route.  The
+    base_url path (``/api/plan/`` vs ``/api/coding/``) or the ``acp://`` scheme
+    identifies the real provider.  Mirror ``gateway.runtime_footer._provider_short``
+    so the session header and the per-message footer agree on the short label
+    (``agent`` / ``coding`` / ``agy(account)``).
+
+    Falls back to the raw provider key on any failure (e.g. CLI runs where the
+    gateway package isn't importable).
+    """
+    try:
+        from gateway.runtime_footer import _agy_account, _provider_short
+
+        base_url = getattr(agent, "base_url", None) or ""
+        label = _provider_short(agent.provider, base_url)
+        if not label:
+            requested = (getattr(agent, "requested_provider", None) or "").strip()
+            label = _provider_short(requested, base_url) or requested
+        if label == "agy":
+            account = _agy_account()
+            if account:
+                label = f"agy({account})"
+        return label or (agent.provider or "")
+    except Exception:
+        return agent.provider or ""
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -807,7 +838,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.model:
         timestamp_line += f"\nModel: {agent.model}"
     if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
+        timestamp_line += f"\nProvider: {_refined_provider_label(agent)}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)

@@ -434,7 +434,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
     "antigravity-acp": "AGY",
-    "volcengine-coding-plan": "Volc",
+    "volcengine-agent-plan": "Volc Agent Plan",
+    "volcengine-coding-plan": "Volc Coding Plan",
 }
 
 
@@ -542,7 +543,19 @@ def get_label(provider_id: str) -> str:
 
     # Check label overrides first
     if canonical in _LABEL_OVERRIDES:
-        return _LABEL_OVERRIDES[canonical]
+        label = _LABEL_OVERRIDES[canonical]
+        if canonical == "antigravity-acp":
+            # Show the active AGY account (e.g. AGY（dirisephan）) so the
+            # provider identity matches the quota/footer convention.
+            try:
+                from gateway.runtime_footer import _agy_account
+
+                account = _agy_account()
+                if account:
+                    label = f"{label}（{account}）"
+            except Exception:
+                pass
+        return label
 
     # Try models.dev
     pdef = get_provider(canonical)
