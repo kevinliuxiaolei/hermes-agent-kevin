@@ -21217,9 +21217,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_display = str(context_length)
 
+        # Render a readable provider label: named custom endpoints (Volc plans,
+        # Antigravity ACP) resolve their runtime provider to the opaque key
+        # ``custom``.  Infer the real label from base_url (volces /api/coding
+        # | /api/plan, acp://antigravity) so the reset banner agrees with the
+        # per-message footer and /status (mirrors runtime_footer._provider_short).
+        try:
+            from gateway.runtime_footer import (
+                _agy_account as _banner_agy_account,
+                _provider_short as _banner_provider_short,
+            )
+            provider_label = _banner_provider_short(provider, base_url)
+            if provider_label == "agy":
+                _banner_acct = _banner_agy_account()
+                if _banner_acct:
+                    provider_label = f"agy({_banner_acct})"
+            provider_label = provider_label or provider or "openrouter"
+        except Exception:
+            provider_label = provider or "openrouter"
+
         lines = [
             f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
+            f"◆ Provider: {provider_label}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
 
