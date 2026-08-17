@@ -706,11 +706,40 @@ class GatewaySlashCommandsMixin:
             configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
+        if not context_total:
+            # Fall back to the provider's per-model context_length from the
+            # providers: dict (e.g. volcengine-agent-plan.models.deepseek-v4-flash).
+            try:
+                _provs = user_config.get("providers") if isinstance(user_config, dict) else None
+                if isinstance(_provs, dict):
+                    _pblock = _provs.get(provider_name) if isinstance(_provs, dict) else None
+                    if isinstance(_pblock, dict):
+                        _mblock = _pblock.get("models")
+                        if isinstance(_mblock, dict):
+                            _mctx = (_mblock.get(model_name) or {}).get("context_length")
+                            if isinstance(_mctx, int) and _mctx > 0:
+                                context_total = _mctx
+            except Exception:
+                pass
 
         model_line = ""
         if model_name:
             if provider_name:
-                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
+                # Refine the raw provider key (custom / volcengine-agent-plan) to
+                # a short readable label like the footer: agent / coding /
+                # agy(account).
+                _short = provider_name
+                try:
+                    from gateway.runtime_footer import _agy_account, _provider_short
+
+                    _short = _provider_short(provider_name, base_url) or provider_name
+                    if _short == "agy":
+                        _acct = _agy_account()
+                        if _acct:
+                            _short = f"agy({_acct})"
+                except Exception:
+                    _short = provider_name
+                model_line = t("gateway.status.model_provider", model=model_name, provider=_short)
             else:
                 model_line = t("gateway.status.model", model=model_name)
 
