@@ -20615,6 +20615,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                # Resolve the effective provider/base_url for the footer label:
+                # session /model override wins, else config default.  base_url
+                # path (volces /api/coding|plan) identifies the plan even when
+                # the runtime provider is reported as ``custom``.
+                _f_provider = None
+                _f_base_url = None
+                try:
+                    _f_override = self._session_model_overrides.get(session_key)
+                    if _f_override:
+                        _f_provider = _f_override.get("provider") or None
+                        _f_base_url = _f_override.get("base_url") or None
+                    if not _f_provider:
+                        _f_cfg = _load_gateway_config()
+                        _f_m = (_f_cfg.get("model") or {})
+                        _f_provider = _f_m.get("provider") or None
+                        _f_base_url = _f_m.get("base_url") or None
+                except Exception:
+                    pass
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -20623,6 +20641,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    provider=_f_provider,
+                    base_url=_f_base_url,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
