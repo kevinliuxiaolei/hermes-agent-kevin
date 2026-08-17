@@ -745,6 +745,31 @@ def init_agent(
     except Exception:
         pass
 
+    # Source-driven AGY alias resolution: translate the ``-latest`` slot
+    # aliases (agy-gemini-flash-high-latest, ...) to the concrete catalog
+    # model from agy_model_resolution.json each turn.  Keeps the alias in
+    # the session override while the runtime uses the verified concrete
+    # model, so the AGY bridge receives the exact upstream id (high/low/
+    # medium stay distinct and track the nightly catalog).
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+        _runtime_profile = _get_provider_profile(agent.provider)
+        if (
+            _runtime_profile
+            and agent.model
+            and hasattr(_runtime_profile, "resolve_runtime_model")
+        ):
+            _requested_runtime_model = agent.model
+            _resolved_runtime_model = _runtime_profile.resolve_runtime_model(
+                _requested_runtime_model,
+                scope_id=getattr(agent, "session_id", None),
+            )
+            if _resolved_runtime_model and _resolved_runtime_model != _requested_runtime_model:
+                agent.requested_model_alias = _requested_runtime_model
+                agent.model = _resolved_runtime_model
+    except Exception:
+        pass
+
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs
