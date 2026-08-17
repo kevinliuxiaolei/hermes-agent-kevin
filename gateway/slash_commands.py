@@ -709,10 +709,18 @@ class GatewaySlashCommandsMixin:
         if not context_total:
             # Fall back to the provider's per-model context_length from the
             # providers: dict (e.g. volcengine-agent-plan.models.deepseek-v4-flash).
+            # provider_name may be the opaque runtime key 'custom' (persisted
+            # billing_provider), so map back to the configured model.provider key.
             try:
                 _provs = user_config.get("providers") if isinstance(user_config, dict) else None
                 if isinstance(_provs, dict):
-                    _pblock = _provs.get(provider_name) if isinstance(_provs, dict) else None
+                    _pkey = provider_name
+                    if _pkey not in _provs:
+                        _model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+                        _cfg_prov = _model_cfg.get("provider") if isinstance(_model_cfg, dict) else ""
+                        if _cfg_prov in _provs:
+                            _pkey = _cfg_prov
+                    _pblock = _provs.get(_pkey)
                     if isinstance(_pblock, dict):
                         _mblock = _pblock.get("models")
                         if isinstance(_mblock, dict):
