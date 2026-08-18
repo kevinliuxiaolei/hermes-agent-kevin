@@ -6705,6 +6705,8 @@ class TurnRunner:
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
+            "provider": (getattr(_agent, "provider", None) if _agent else None),
+            "base_url": (getattr(_agent, "base_url", None) if _agent else None),
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -20616,23 +20618,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
                 # Resolve the effective provider/base_url for the footer label:
-                # session /model override wins, else config default.  base_url
-                # path (volces /api/coding|plan) identifies the plan even when
-                # the runtime provider is reported as ``custom``.
-                _f_provider = None
-                _f_base_url = None
-                try:
-                    _f_override = self._session_model_overrides.get(session_key)
-                    if _f_override:
-                        _f_provider = _f_override.get("provider") or None
-                        _f_base_url = _f_override.get("base_url") or None
-                    if not _f_provider:
-                        _f_cfg = _load_gateway_config()
-                        _f_m = (_f_cfg.get("model") or {})
-                        _f_provider = _f_m.get("provider") or None
-                        _f_base_url = _f_m.get("base_url") or None
-                except Exception:
-                    pass
+                # the ACTUAL executed route (agent_result.provider/base_url,
+                # which reflect any fallback) wins, else session /model
+                # override, else config default.  base_url path (volces
+                # /api/coding|plan) identifies the plan even when the runtime
+                # provider is reported as ``custom``.
+                _f_provider = agent_result.get("provider") or None
+                _f_base_url = agent_result.get("base_url") or None
+                if not (_f_provider and _f_base_url):
+                    # Incomplete actual route — use the intended (override /
+                    # config) pair so provider and base_url stay consistent.
+                    _f_provider = None
+                    _f_base_url = None
+                    try:
+                        _f_override = self._session_model_overrides.get(session_key)
+                        if _f_override:
+                            _f_provider = _f_override.get("provider") or None
+                            _f_base_url = _f_override.get("base_url") or None
+                        if not _f_provider:
+                            _f_cfg = _load_gateway_config()
+                            _f_m = (_f_cfg.get("model") or {})
+                            _f_provider = _f_m.get("provider") or None
+                            _f_base_url = _f_m.get("base_url") or None
+                    except Exception:
+                        pass
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
