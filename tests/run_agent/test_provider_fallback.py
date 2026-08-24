@@ -73,6 +73,44 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
 
+    def test_named_custom_fallback_uses_endpoint_aware_pool_key(self):
+        agent = _make_agent(fallback_model=[{
+            "provider": "volcengine-agent-plan",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+        }])
+        primary_pool = MagicMock(provider="custom:volcengine-coding-plan")
+        agent._credential_pool = primary_pool
+        fallback_pool = MagicMock()
+        fallback_pool.has_credentials.return_value = True
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client("https://ark.cn-beijing.volces.com/api/plan/v3"),
+                    "deepseek-v4-flash",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.credential_pool.resolve_runtime_pool_key",
+                return_value="custom:volcengine-agent-plan",
+            ) as resolve_key,
+            patch("agent.credential_pool.load_pool", return_value=fallback_pool) as load,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        resolve_key.assert_called_once_with(
+            "volcengine-agent-plan",
+            "https://ark.cn-beijing.volces.com/api/plan/v3",
+        )
+        load.assert_called_once_with("custom:volcengine-agent-plan")
+        assert agent._credential_pool is fallback_pool
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},

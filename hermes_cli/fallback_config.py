@@ -105,3 +105,59 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+VOLC_SELECTION_FAMILY = "volc"
+VOLC_SELECTION_POLICY = "coding-primary-agent-sibling"
+
+
+def build_effective_fallback_chain(
+    primary: dict[str, Any],
+    selection: dict[str, Any] | None,
+    configured: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Build a route-aware fallback chain without reading config or secrets."""
+    chain: list[dict[str, Any]] = []
+    selection = selection or {}
+    if (
+        selection.get("selection_family") == VOLC_SELECTION_FAMILY
+        and selection.get("selection_policy") == VOLC_SELECTION_POLICY
+        and str(primary.get("provider") or "").lower() == "volcengine-coding-plan"
+        and primary.get("model")
+    ):
+        base_url = _normalized_base_url(primary.get("base_url"))
+        if "/api/coding/" in base_url:
+            base_url = base_url.replace("/api/coding/", "/api/plan/", 1)
+        sibling: dict[str, Any] = {
+            "provider": "volcengine-agent-plan",
+            "model": str(primary["model"]),
+        }
+        if base_url:
+            sibling["base_url"] = base_url
+        if primary.get("api_mode"):
+            sibling["api_mode"] = primary["api_mode"]
+        chain.append(sibling)
+
+    chain.extend(dict(entry) for entry in (configured or []) if isinstance(entry, dict))
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    seen_routes: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for entry in chain:
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or "").strip().lower()
+        base_url = _normalized_base_url(entry.get("base_url")).lower()
+        api_mode = str(entry.get("api_mode") or "").strip().lower()
+        identity = (provider, model, base_url, api_mode)
+        weak_identity = (provider, model)
+        prior_routes = seen_routes.get(weak_identity, [])
+        overlaps_prior = any(
+            (not base_url or not prior_base or base_url == prior_base)
+            and (not api_mode or not prior_mode or api_mode == prior_mode)
+            for prior_base, prior_mode in prior_routes
+        )
+        if not provider or not model or identity in seen or overlaps_prior:
+            continue
+        seen.add(identity)
+        seen_routes.setdefault(weak_identity, []).append((base_url, api_mode))
+        deduped.append(entry)
+    return deduped

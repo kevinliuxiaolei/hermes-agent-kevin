@@ -620,6 +620,12 @@ class ModelSwitchResult:
     api_key: str = ""
     base_url: str = ""
     api_mode: str = ""
+    command: str = ""
+    args: tuple[str, ...] = ()
+    source: str = ""
+    requested_provider: str = ""
+    credential_pool: Any = None
+    request_overrides: Optional[dict[str, Any]] = None
     error_message: str = ""
     warning_message: str = ""
     provider_label: str = ""
@@ -1496,6 +1502,7 @@ def switch_model(
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     resolved_alias = ""
+    runtime: dict[str, Any] = {}
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
@@ -2192,6 +2199,12 @@ def switch_model(
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
+        command=str(runtime.get("command") or ""),
+        args=tuple(runtime.get("args") or ()),
+        source=str(runtime.get("source") or ""),
+        requested_provider=str(runtime.get("requested_provider") or target_provider),
+        credential_pool=runtime.get("credential_pool"),
+        request_overrides=runtime.get("request_overrides"),
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
@@ -3999,4 +4012,74 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
-    return filtered
+    # Overlay quick picker.  Full/typed provider discovery remains above and is
+    # intentionally unmodified.
+    by_slug = {str(row.get("slug") or "").strip().lower(): row for row in filtered}
+    if not any(slug in by_slug for slug in (
+        "openai-codex", "antigravity-acp", "volcengine-coding-plan"
+    )):
+        return filtered
+
+    quick: List[dict] = []
+
+    def _view(
+        provider_slug: str,
+        name: str,
+        models: list[str] | None = None,
+        *,
+        public_slug: str | None = None,
+    ) -> None:
+        source = by_slug.get(provider_slug)
+        if source is None:
+            return
+        row = dict(source)
+        row["name"] = name
+        row["provider_slug"] = provider_slug
+        row["slug"] = public_slug or provider_slug
+        if models is not None:
+            available = {str(m).lower(): str(m) for m in source.get("models") or []}
+            selected = [available[m.lower()] for m in models if m.lower() in available]
+            row["models"] = selected
+            row["total_models"] = len(selected)
+        if models is not None and source.get("is_current"):
+            row["is_current"] = str(current_model or "").lower() in {
+                str(model).lower() for model in row.get("models") or []
+            }
+        quick.append(row)
+
+    _view("openai-codex", "Codex")
+    agy = by_slug.get("antigravity-acp")
+    agy_models: list[str] = []
+    if agy is not None:
+        agy_models = [str(m) for m in agy.get("models") or []]
+        # Merge the AGY profile's cache-only nightly/curated catalog so aliases
+        # such as GPT-OSS do not disappear merely because config.yaml lists a
+        # smaller explicit subset. provider_model_ids is scoped to AGY's local
+        # cache and does not invoke the external process.
+        try:
+            from hermes_cli.models import provider_model_ids
+
+            seen_agy = {m.lower() for m in agy_models}
+            for model_id in provider_model_ids("antigravity-acp"):
+                model_id = str(model_id)
+                if model_id.lower() not in seen_agy:
+                    agy_models.append(model_id)
+                    seen_agy.add(model_id.lower())
+        except Exception:
+            pass
+        agy = dict(agy)
+        agy["models"] = agy_models
+        agy["total_models"] = len(agy_models)
+        by_slug["antigravity-acp"] = agy
+        _view("antigravity-acp", "AGY Gemini", [
+            m for m in agy_models if m.lower().startswith("agy-gemini-")
+        ], public_slug="agy-gemini")
+    _view("volcengine-coding-plan", "Volc", [
+        "ark-code-latest", "deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3",
+        "kimi-k2.7-code", "doubao-seed-2.1-turbo", "doubao-seed-evolving",
+    ])
+    if agy is not None:
+        _view("antigravity-acp", "AGY OSS/Claude", [
+            m for m in agy_models if "gemini" not in m.lower()
+        ], public_slug="agy-oss-claude")
+    return quick

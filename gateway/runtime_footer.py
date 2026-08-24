@@ -72,8 +72,9 @@ def _provider_short(provider: Optional[str], base_url: Optional[str] = None) -> 
     if not p and not b:
         return ""
 
-    # base_url 优先：custom 路由也能识别 plan
-    if "ark.cn-beijing.volces.com" in b:
+    # A concrete runtime provider is authoritative. Infer from URL only when
+    # the SDK reports the opaque ``custom`` identity.
+    if p in {"", "custom"} and "ark.cn-beijing.volces.com" in b:
         if "/api/plan/" in b or "/api/plan" == b or b.rstrip("/").endswith("/api/plan"):
             return "agent"
         if "/api/coding/" in b or "/api/coding" == b or b.rstrip("/").endswith("/api/coding"):
@@ -93,6 +94,21 @@ def _provider_short(provider: Optional[str], base_url: Optional[str] = None) -> 
     if p:
         return p.split(":")[-1][:12]
     return ""
+
+
+def _resolve_runtime_route(
+    *,
+    actual_provider: Optional[str],
+    actual_base_url: Optional[str],
+    intended_provider: Optional[str],
+    intended_base_url: Optional[str],
+) -> tuple[str, str]:
+    """Prefer authoritative actual identity and fill only opaque URL data."""
+    provider = str(actual_provider or intended_provider or "")
+    actual_url = str(actual_base_url or "")
+    if actual_provider and str(actual_provider).strip().lower() != "custom":
+        return provider, actual_url
+    return provider, actual_url or str(intended_base_url or "")
 
 
 def _agy_account() -> str:

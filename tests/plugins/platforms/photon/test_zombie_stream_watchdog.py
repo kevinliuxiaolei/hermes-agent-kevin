@@ -73,6 +73,7 @@ def test_probe_rejection_classification_is_strict() -> None:
           notFoundCode: classifyProbeRejection({ code: 5, message: "5 NOT_FOUND: nope" }),
           notFoundText: classifyProbeRejection(new Error("message not found")),
           sdkNotFound: classifyProbeRejection({ code: "notFound", message: "missing" }),
+          guidValidation: classifyProbeRejection({ code: "UNKNOWN", message: "[spectrum-imessage] Expected message resource GUID" }),
           unavailable: classifyProbeRejection({ code: 14, message: "14 UNAVAILABLE: connect failed" }),
           deadline: classifyProbeRejection({ code: 4, message: "4 DEADLINE_EXCEEDED" }),
           generic: classifyProbeRejection(new Error("socket hang up")),
@@ -85,8 +86,9 @@ def test_probe_rejection_classification_is_strict() -> None:
     for name in ("notFoundCode", "notFoundText", "sdkNotFound"):
         assert out[name]["alive"] is True, name
         assert out[name]["inconclusive"] is False, name
-    # Everything else: not alive AND explicitly inconclusive.
-    for name in ("unavailable", "deadline", "generic", "weird"):
+    # Validation may happen before authenticated upstream I/O and therefore
+    # cannot prove the channel is live. Everything else is inconclusive too.
+    for name in ("guidValidation", "unavailable", "deadline", "generic", "weird"):
         assert out[name]["alive"] is False, name
         assert out[name]["inconclusive"] is True, name
 

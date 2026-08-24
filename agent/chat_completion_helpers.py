@@ -2695,9 +2695,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 agent._credential_pool_entry_id = None
         if getattr(agent, "_credential_pool", None) is None:
             try:
-                from agent.credential_pool import load_pool
+                from agent.credential_pool import load_pool, resolve_runtime_pool_key
 
-                fallback_pool = load_pool(fb_provider)
+                fallback_pool_key = resolve_runtime_pool_key(fb_provider, fb_base_url)
+                fallback_pool = load_pool(fallback_pool_key)
                 if fallback_pool and fallback_pool.has_credentials():
                     agent._credential_pool = fallback_pool
                     logger.info(

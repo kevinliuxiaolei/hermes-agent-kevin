@@ -9195,6 +9195,15 @@ def _define_discord_view_classes() -> None:
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
             )
 
+        def _runtime_provider_slug(self) -> str:
+            provider = next(
+                (p for p in self.providers if p.get("slug") == self._selected_provider),
+                None,
+            )
+            if provider:
+                return str(provider.get("provider_slug") or self._selected_provider)
+            return self._selected_provider
+
         def _build_provider_select(self):
             """Build the provider dropdown menu."""
             self.clear_items()
@@ -9334,7 +9343,7 @@ def _define_discord_view_classes() -> None:
                 return await asyncio.to_thread(
                     combined_selection_warning,
                     model_id,
-                    provider=self._selected_provider,
+                    provider=self._runtime_provider_slug(),
                 )
             except Exception:
                 return None
@@ -9406,7 +9415,7 @@ def _define_discord_view_classes() -> None:
                 result_text = await self.on_model_selected(
                     str(interaction.channel_id),
                     model_id,
-                    self._selected_provider,
+                    self._runtime_provider_slug(),
                 )
             except Exception as exc:
                 result_text = f"Error switching model: {exc}"

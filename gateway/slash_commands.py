@@ -2046,7 +2046,18 @@ class GatewaySlashCommandsMixin:
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
+                            "command": result.command,
+                            "args": list(result.args),
+                            "source": result.source,
+                            "requested_provider": result.requested_provider,
+                            "credential_pool": result.credential_pool,
+                            "request_overrides": result.request_overrides,
                         }
+                        if provider_slug == "volcengine-coding-plan":
+                            _self._session_model_overrides[_session_key].update({
+                                "selection_family": "volc",
+                                "selection_policy": "coding-primary-agent-sibling",
+                            })
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2102,6 +2113,12 @@ class GatewaySlashCommandsMixin:
                                     _persist_model_cfg.pop("context_length", None)
                                 _persist_model_cfg["default"] = result.new_model
                                 _persist_model_cfg["provider"] = result.target_provider
+                                if provider_slug == "volcengine-coding-plan":
+                                    _persist_model_cfg["selection_family"] = "volc"
+                                    _persist_model_cfg["selection_policy"] = "coding-primary-agent-sibling"
+                                else:
+                                    _persist_model_cfg.pop("selection_family", None)
+                                    _persist_model_cfg.pop("selection_policy", None)
                                 # Named providers always resolve base_url/api_mode fresh,
                                 # so any leftover is cleared unconditionally below. Custom
                                 # providers have no registry entry to re-derive from, so
@@ -2191,6 +2208,8 @@ class GatewaySlashCommandsMixin:
                             )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    metadata = dict(metadata or {})
+                    metadata["requester_id"] = str(source.user_id or "")
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -2211,18 +2230,20 @@ class GatewaySlashCommandsMixin:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
-                    list_authenticated_providers,
+                    list_picker_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
                     user_providers=user_provs,
                     custom_providers=custom_provs,
-                    max_models=5,
+                    max_models=50,
+                    include_moa=True,
                     excluded_providers=excluded_provs,
                 )
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
-                    lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
+                    runtime_slug = p.get("provider_slug") or p["slug"]
+                    lines.append(f"**{p['name']}** `--provider {runtime_slug}`{tag}:")
                     if p["models"]:
                         model_strs = ", ".join(f"`{m}`" for m in p["models"])
                         extra = t("gateway.model.more_models_suffix", count=p["total_models"] - len(p["models"])) if p["total_models"] > len(p["models"]) else ""
@@ -2433,6 +2454,10 @@ class GatewaySlashCommandsMixin:
                         model_cfg.pop("context_length", None)
                     model_cfg["default"] = result.new_model
                     model_cfg["provider"] = result.target_provider
+                    # Typed /model selects a concrete route. Clear any logical
+                    # quick-picker policy left by an earlier public Volc pick.
+                    model_cfg.pop("selection_family", None)
+                    model_cfg.pop("selection_policy", None)
                     # See the picker handler above for why custom providers need an
                     # explicit set-or-clear instead of the old lone truthy check (#25107).
                     _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"

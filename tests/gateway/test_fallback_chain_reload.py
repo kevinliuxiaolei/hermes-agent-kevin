@@ -80,14 +80,10 @@ def test_background_and_main_agent_paths_call_refresh():
     source = (
         Path(__file__).resolve().parent.parent.parent / "gateway" / "run.py"
     ).read_text(encoding="utf-8")
-    # The agent-construction site inside TurnRunner.run_sync (extracted from
-    # the old _run_agent_inner closure) references the runner as
-    # ``self._runner``; the background-agent site still uses bare ``self``.
-    _refresh_calls = (
-        source.count("fallback_model=self._refresh_fallback_model()")
-        + source.count("fallback_model=self._runner._refresh_fallback_model()")
-    )
-    assert _refresh_calls >= 2
+    # Main and background agent creation refresh config and then pass it
+    # through the route-aware effective-chain builder before construction.
+    assert source.count("_effective_fallback_chain_for_route(") >= 3
+    assert source.count("_refresh_fallback_model()") >= 3
     # The cached-agent reuse path (the load-bearing fix for a long-lived
     # session in a running gateway) must apply the refreshed chain.
     assert (

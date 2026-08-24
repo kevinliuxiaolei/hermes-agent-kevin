@@ -257,3 +257,26 @@ class TestOneTurnNeverPersisted:
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_typed_global_switch_clears_stale_logical_policy(
+        self, tmp_path, monkeypatch
+    ):
+        import yaml
+
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        cfg_path = tmp_path / ".hermes" / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["model"].update({
+            "selection_family": "volc",
+            "selection_policy": "coding-primary-agent-sibling",
+        })
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        result = await runner._handle_model_command(
+            self._event("/model gpt-5.5 --global")
+        )
+
+        assert result is not None and "gpt-5.5" in result
+        saved = yaml.safe_load(cfg_path.read_text())["model"]
+        assert "selection_family" not in saved
+        assert "selection_policy" not in saved

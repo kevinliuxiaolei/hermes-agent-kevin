@@ -6591,8 +6591,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
+            # Scope picker state to the Telegram topic as well as the chat.
+            # Forum topics share chat_id; a chat-only key lets one topic's
+            # picker overwrite another's callback/session state.
+            state_key = self._model_picker_state_key(chat_id, thread_id, msg.message_id)
+            self._model_picker_state[state_key] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
                 "session_key": session_key,
@@ -6600,6 +6603,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "provider_page": 0,
+                "requester_id": str((metadata or {}).get("requester_id") or ""),
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -6732,6 +6736,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     _MODEL_PAGE_SIZE = 8
 
+    @staticmethod
+    def _model_picker_state_key(
+        chat_id: Any, thread_id: Any = None, message_id: Any = None,
+    ) -> str:
+        return (
+            f"{chat_id}:{'' if thread_id in (None, '') else thread_id}:"
+            f"{'' if message_id in (None, '') else message_id}"
+        )
+
     def _build_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
         """Build the paginated top-level provider keyboard, folding groups.
 
@@ -6841,9 +6854,32 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        query_thread_id = getattr(query_message, "message_thread_id", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        state_key = self._model_picker_state_key(
+            chat_id, query_thread_id, query_message_id,
+        )
+        state = self._model_picker_state.get(state_key)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
+            return
+
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(text="⛔ You are not authorized to change this setting.")
+            return
+
+        expected_requester = str(state.get("requester_id") or "")
+        actual_requester = str(getattr(query.from_user, "id", ""))
+        if expected_requester and actual_requester != expected_requester:
+            await query.answer(text="⛔ This picker belongs to another user.")
             return
 
         try:
@@ -6865,6 +6901,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             models = provider.get("models", [])
             state["selected_provider"] = provider_slug
+            state["selected_runtime_provider"] = provider.get("provider_slug", provider_slug)
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
             state["model_page"] = 0
@@ -6971,7 +7008,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            provider_slug = state.get("selected_runtime_provider") or state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
@@ -7004,7 +7041,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(
                 text="Switch failed." if switch_failed else "Model switched!"
             )
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mm:"):
             # --- Model selected: perform the switch ---
@@ -7020,7 +7057,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            provider_slug = state.get("selected_runtime_provider") or state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
@@ -7087,7 +7124,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---
@@ -7161,7 +7198,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mx":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,

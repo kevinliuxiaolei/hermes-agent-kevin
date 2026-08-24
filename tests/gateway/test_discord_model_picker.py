@@ -83,3 +83,36 @@ async def test_model_picker_clears_controls_before_running_switch_callback():
     interaction.edit_original_response.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_virtual_agy_row_switches_with_concrete_provider_slug():
+    selected = AsyncMock(return_value="ok")
+    view = ModelPickerView(
+        providers=[{
+            "slug": "agy-oss-claude",
+            "provider_slug": "antigravity-acp",
+            "name": "AGY OSS/Claude",
+            "models": ["claude-sonnet-4-6"],
+            "total_models": 1,
+        }],
+        current_model="gemini-3.7-flash-high",
+        current_provider="antigravity-acp",
+        session_key="session-1",
+        on_model_selected=selected,
+        allowed_user_ids={"123"},
+    )
+    view._selected_provider = "agy-oss-claude"
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123),
+        channel_id=456,
+        data={"values": ["claude-sonnet-4-6"]},
+        response=SimpleNamespace(
+            defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock(),
+        ),
+        edit_original_response=AsyncMock(),
+    )
+
+    await view._on_model_selected(interaction)
+
+    selected.assert_awaited_once_with(
+        "456", "claude-sonnet-4-6", "antigravity-acp"
+    )

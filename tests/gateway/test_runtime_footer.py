@@ -10,10 +10,33 @@ import pytest
 from gateway.runtime_footer import (
     _home_relative_cwd,
     _model_short,
+    _resolve_runtime_route,
     build_footer_line,
     format_runtime_footer,
     resolve_footer_config,
 )
+
+
+def test_runtime_route_trusts_actual_provider_without_base_url():
+    provider, base_url = _resolve_runtime_route(
+        actual_provider="volcengine-agent-plan",
+        actual_base_url="",
+        intended_provider="volcengine-coding-plan",
+        intended_base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+    )
+    assert provider == "volcengine-agent-plan"
+    assert base_url == ""
+
+
+def test_runtime_route_uses_base_url_only_to_discriminate_opaque_actual_provider():
+    provider, base_url = _resolve_runtime_route(
+        actual_provider="custom",
+        actual_base_url="",
+        intended_provider="volcengine-coding-plan",
+        intended_base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+    )
+    assert provider == "custom"
+    assert base_url.endswith("/api/coding/v3")
 
 
 # ---------------------------------------------------------------------------

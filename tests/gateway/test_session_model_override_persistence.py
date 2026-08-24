@@ -83,6 +83,7 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
         "model": "gpt-5o",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
     }
 
 
@@ -132,4 +133,5 @@ def test_sanitize_model_override():
         "model": "gpt-5o",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
     }

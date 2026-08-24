@@ -66,7 +66,7 @@ from agent.turn_context import (
     compression_made_progress,
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import build_effective_fallback_chain, get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -3001,14 +3001,16 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     )
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str, target_model: Optional[str] = None,
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider(requested=provider, target_model=target_model)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -3020,6 +3022,8 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "source": runtime.get("source"),
+        "request_overrides": runtime.get("request_overrides"),
     }
 
 
@@ -5726,6 +5730,8 @@ class TurnRunner:
         # must reach the next turn (#60955).  Per-session turn
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
+            agent._selection_family = turn_route.get("selection_family")
+            agent._selection_policy = turn_route.get("selection_policy")
             self._runner._apply_fallback_chain_to_agent(
                 agent, self._runner._refresh_fallback_model(),
             )
@@ -5751,7 +5757,13 @@ class TurnRunner:
                     pass
 
         if agent is None:
-            # Config changed or first message — create fresh agent
+            # Config changed or first message — create fresh agent. Build the
+            # route-aware chain before construction so the first failure can
+            # move to the same-model sibling Plan.
+            configured_fallbacks = self._runner._refresh_fallback_model()
+            effective_fallbacks = self._runner._effective_fallback_chain_for_route(
+                turn_route, configured_fallbacks,
+            )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5783,13 +5795,15 @@ class TurnRunner:
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
-                # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
+                # Effective chain includes logical same-model sibling policy.
+                fallback_model=effective_fallbacks,
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            agent._selection_family = turn_route.get("selection_family")
+            agent._selection_policy = turn_route.get("selection_policy")
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -8083,12 +8097,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override:
             override_model = override.get("model", model)
             override_runtime = {
-                "provider": override.get("provider"),
-                "api_key": override.get("api_key"),
-                "base_url": override.get("base_url"),
-                "api_mode": override.get("api_mode"),
-                "max_tokens": override.get("max_tokens"),
-                "credential_pool": override.get("credential_pool"),
+                key: override.get(key)
+                for key in (
+                    "provider", "api_key", "base_url", "api_mode", "max_tokens",
+                    "credential_pool", "command", "args", "source",
+                    "requested_provider", "request_overrides", "selection_family",
+                    "selection_policy",
+                )
             }
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
@@ -8163,6 +8178,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+        elif isinstance(user_config, dict):
+            model_cfg = user_config.get("model") or {}
+            if isinstance(model_cfg, dict):
+                for key in ("selection_family", "selection_policy"):
+                    if model_cfg.get(key):
+                        runtime_kwargs[key] = model_cfg[key]
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -8241,6 +8262,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route = {
             "model": model,
             "runtime": runtime,
+            "selection_family": runtime_kwargs.get("selection_family"),
+            "selection_policy": runtime_kwargs.get("selection_policy"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -8249,6 +8272,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime_kwargs.get("selection_family"),
+                runtime_kwargs.get("selection_policy"),
             ),
         }
 
@@ -9897,6 +9922,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return self._fallback_model
 
     @staticmethod
+    def _effective_fallback_chain_for_route(
+        route: dict[str, Any], chain: list | None,
+    ) -> list[dict[str, Any]]:
+        runtime = dict(route.get("runtime") or {})
+        return build_effective_fallback_chain(
+            {
+                "provider": runtime.get("provider"),
+                "model": route.get("model"),
+                "base_url": runtime.get("base_url"),
+                "api_mode": runtime.get("api_mode"),
+            },
+            {
+                "selection_family": route.get("selection_family"),
+                "selection_policy": route.get("selection_policy"),
+            },
+            chain,
+        )
+
+    @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
         """Keep a cached agent's fallback chain aligned with current config.
 
@@ -9908,13 +9952,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if agent is None:
             return
-        new_chain = list(chain or [])
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if (
             getattr(agent, "_fallback_activated", False)
             and rate_limited_until > time.monotonic()
         ):
             return
+        new_chain = build_effective_fallback_chain(
+            {
+                "provider": getattr(agent, "provider", None),
+                "model": getattr(agent, "model", None),
+                "base_url": getattr(agent, "base_url", None),
+                "api_mode": getattr(agent, "api_mode", None),
+            },
+            {
+                "selection_family": getattr(agent, "_selection_family", None),
+                "selection_policy": getattr(agent, "_selection_policy", None),
+            },
+            chain,
+        )
         old_chain = list(getattr(agent, "_fallback_chain", []) or [])
         agent._fallback_chain = new_chain
         agent._fallback_model = new_chain[0] if new_chain else None
@@ -20623,25 +20679,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # override, else config default.  base_url path (volces
                 # /api/coding|plan) identifies the plan even when the runtime
                 # provider is reported as ``custom``.
-                _f_provider = agent_result.get("provider") or None
-                _f_base_url = agent_result.get("base_url") or None
-                if not (_f_provider and _f_base_url):
-                    # Incomplete actual route — use the intended (override /
-                    # config) pair so provider and base_url stay consistent.
-                    _f_provider = None
-                    _f_base_url = None
-                    try:
-                        _f_override = self._session_model_overrides.get(session_key)
-                        if _f_override:
-                            _f_provider = _f_override.get("provider") or None
-                            _f_base_url = _f_override.get("base_url") or None
-                        if not _f_provider:
-                            _f_cfg = _load_gateway_config()
-                            _f_m = (_f_cfg.get("model") or {})
-                            _f_provider = _f_m.get("provider") or None
-                            _f_base_url = _f_m.get("base_url") or None
-                    except Exception:
-                        pass
+                _f_intended_provider = None
+                _f_intended_base_url = None
+                try:
+                    _f_override = self._session_model_overrides.get(session_key)
+                    _f_cfg = _load_gateway_config()
+                    _f_m = (_f_cfg.get("model") or {})
+                    _f_intended_provider = (_f_override or {}).get("provider") or _f_m.get("provider")
+                    _f_intended_base_url = (_f_override or {}).get("base_url") or _f_m.get("base_url")
+                except Exception:
+                    pass
+                from gateway.runtime_footer import _resolve_runtime_route
+                _f_provider, _f_base_url = _resolve_runtime_route(
+                    actual_provider=agent_result.get("provider"),
+                    actual_base_url=agent_result.get("base_url"),
+                    intended_provider=_f_intended_provider,
+                    intended_base_url=_f_intended_base_url,
+                )
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -22764,6 +22818,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            effective_fallbacks = self._effective_fallback_chain_for_route(
+                turn_route, self._refresh_fallback_model(),
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -22811,9 +22868,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=effective_fallbacks,
                 )
+                agent._selection_family = turn_route.get("selection_family")
+                agent._selection_policy = turn_route.get("selection_policy")
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -26562,9 +26620,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not persisted:
             return
         override: Dict[str, Any] = {
-            "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
+            key: persisted.get(key)
+            for key in (
+                "model", "provider", "base_url", "api_mode", "requested_provider",
+                "source", "selection_family", "selection_policy",
+            )
+            if persisted.get(key) not in (None, "")
         }
         provider = persisted.get("provider")
         if provider:
@@ -26573,10 +26634,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # credential-less override — _resolve_session_agent_runtime falls
             # back to env-based resolution and applies model/provider on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    provider, target_model=persisted.get("model")
+                )
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
+                override["command"] = runtime.get("command")
+                override["args"] = list(runtime.get("args") or [])
+                override["source"] = runtime.get("source")
+                override["requested_provider"] = runtime.get("requested_provider")
+                override["request_overrides"] = runtime.get("request_overrides")
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
             except Exception:
@@ -26607,7 +26675,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in (
+            "provider", "api_key", "base_url", "api_mode", "credential_pool",
+            "command", "args", "source", "requested_provider", "request_overrides",
+            "selection_family", "selection_policy",
+        ):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

@@ -261,11 +261,14 @@ def _xai_curated_models() -> list[str]:
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "moa": ["default"],
     "antigravity-acp": [
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash-high",
-        "gemini-3.1-pro-high",
+        "agy-gemini-flash-high-latest",
+        "agy-gemini-flash-medium-latest",
+        "agy-gemini-flash-low-latest",
+        "agy-gemini-flash-lite-latest",
+        "agy-gemini-pro-high-latest",
         "claude-sonnet-4-6",
         "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium",
     ],
     "nous": [
         # Anthropic
@@ -1314,7 +1317,6 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
-    "volc":     ("Volcengine",      "Volc Coding Plan & Agent Plan (auto-routed)",       ["volcengine-coding-plan", "volcengine-agent-plan"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -4094,6 +4096,21 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         from hermes_cli.auth import resolve_api_key_provider_credentials
 
         _p = get_provider_profile(normalized)
+        if _p and _p.auth_type == "external_process" and normalized == "antigravity-acp":
+            # This provider's fetch_models implementation is explicitly
+            # cache-only: it reads the nightly catalog JSON and never spawns AGY.
+            live = _p.fetch_models(api_key=None, base_url=None)
+            curated = list(_PROVIDER_MODELS.get(normalized, [])) or list(
+                _p.fallback_models or ()
+            )
+            merged = list(curated)
+            seen = {m.lower() for m in merged}
+            for model_id in live or ():
+                if model_id.lower() not in seen:
+                    merged.append(model_id)
+                    seen.add(model_id.lower())
+            if merged:
+                return merged
         if _p and _p.auth_type == "api_key" and _p.base_url:
             try:
                 creds = resolve_api_key_provider_credentials(normalized)
