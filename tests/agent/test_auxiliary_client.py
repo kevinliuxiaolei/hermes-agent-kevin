@@ -507,6 +507,33 @@ class TestNormalizeAuxProvider:
         assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
 
 
+class TestExternalProcessProviderResolution:
+    def test_antigravity_acp_builds_subprocess_client(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_external_process_provider_credentials",
+            lambda provider: {
+                "api_key": "external-process",
+                "base_url": "acp://antigravity",
+                "command": "/tmp/agy_acp_bridge.py",
+                "args": ["--test"],
+            },
+        )
+
+        client, model = resolve_provider_client(
+            "antigravity-acp",
+            model="agy-gemini-flash-high-latest",
+            raw_codex=True,
+            explicit_base_url="acp://antigravity",
+        )
+
+        from agent.copilot_acp_client import CopilotACPClient
+
+        assert isinstance(client, CopilotACPClient)
+        assert model == "agy-gemini-flash-high-latest"
+        assert client._acp_command == "/tmp/agy_acp_bridge.py"
+        assert client._acp_args == ["--test"]
+
+
 class TestReadCodexAccessToken:
     def test_valid_auth_store(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
