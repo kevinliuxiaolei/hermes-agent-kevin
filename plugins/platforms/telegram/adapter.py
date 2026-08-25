@@ -6812,7 +6812,70 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return InlineKeyboardMarkup(rows), page_meta["page_info"]
 
-    def _build_model_keyboard(self, models: list, page: int) -> tuple:
+    def _display_model_label(self, model_id: str, provider_slug: str = "") -> str:
+        """Map model ID to a clean, simplified display label for AGY and Volc models."""
+        p_slug = str(provider_slug or "").lower().strip()
+        m_id = str(model_id or "").lower().strip()
+
+        # 1. AGY Gemini (antigravity-acp / agy-gemini)
+        if m_id.startswith("agy-gemini-"):
+            name = m_id[len("agy-gemini-"):]
+            if name.endswith("-latest"):
+                name = name[:-len("-latest")]
+            return name.replace("-", " ").title()
+
+        # 2. AGY OSS/Claude (agy-oss-claude)
+        if p_slug == "agy-oss-claude" or m_id in ("claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"):
+            if m_id == "claude-sonnet-4-6":
+                return "Sonnet 4.6"
+            if m_id == "claude-opus-4-6-thinking":
+                return "Opus 4.6"
+            if m_id == "gpt-oss-120b-medium":
+                return "GPT OSS 120B"
+
+        # 3. Volc (volcengine-coding-plan)
+        if p_slug == "volcengine-coding-plan" or m_id in (
+            "ark-code-latest", "deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3",
+            "kimi-k2.7-code", "doubao-seed-2.1-turbo", "doubao-seed-evolving"
+        ):
+            volc_map = {
+                "ark-code-latest": "Ark Code",
+                "deepseek-v4-flash": "DeepSeek Flash",
+                "deepseek-v4-pro": "DeepSeek Pro",
+                "glm-5.3": "GLM 5.3",
+                "kimi-k2.7-code": "Kimi Code",
+                "doubao-seed-2.1-turbo": "Doubao Turbo",
+                "doubao-seed-evolving": "Doubao Evolving",
+            }
+            if m_id in volc_map:
+                return volc_map[m_id]
+
+        # 4. OpenAI Codex (openai-codex)
+        if p_slug in ("openai-codex", "openai") or m_id.startswith("gpt-"):
+            codex_map = {
+                "gpt-5.6-sol": "5.6 Sol",
+                "gpt-5.6-sol-900k": "5.6 Sol 900k",
+                "gpt-5.6-terra": "5.6 Terra",
+                "gpt-5.6-terra-900k": "5.6 Terra 900k",
+                "gpt-5.6-luna": "5.6 Luna",
+                "gpt-5.6-luna-900k": "5.6 Luna 900k",
+                "gpt-5.5": "5.5",
+                "gpt-5.4-mini": "5.4 Mini",
+                "gpt-5.4": "5.4",
+                "gpt-5.4-900k": "5.4 900k",
+                "gpt-5.3-codex": "5.3 Codex",
+                "gpt-5.3-codex-spark": "5.3 Spark",
+            }
+            if m_id in codex_map:
+                return codex_map[m_id]
+
+        # Default fallback
+        short = model_id.split("/")[-1] if "/" in model_id else model_id
+        if len(short) > 38:
+            short = short[:35] + "..."
+        return short
+
+    def _build_model_keyboard(self, models: list, page: int, provider_slug: str = "") -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
         page_models, page_meta = self._format_choice_page(
             models, page, self._MODEL_PAGE_SIZE
@@ -6824,11 +6887,9 @@ class TelegramAdapter(BasePlatformAdapter):
         buttons: list = []
         for i, model_id in enumerate(page_models):
             abs_idx = start + i
-            short = model_id.split("/")[-1] if "/" in model_id else model_id
-            if len(short) > 38:
-                short = short[:35] + "..."
+            label = self._display_model_label(model_id, provider_slug)
             buttons.append(
-                InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
+                InlineKeyboardButton(label, callback_data=f"mm:{abs_idx}")
             )
 
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
@@ -6906,7 +6967,7 @@ class TelegramAdapter(BasePlatformAdapter):
             state["model_list"] = models
             state["model_page"] = 0
 
-            keyboard, page_info = self._build_model_keyboard(models, 0)
+            keyboard, page_info = self._build_model_keyboard(models, 0, provider_slug)
 
             pname = provider.get("name", provider_slug)
             total = provider.get("total_models", len(models))
@@ -6936,11 +6997,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
             models = state.get("model_list", [])
             state["model_page"] = page
-
-            keyboard, page_info = self._build_model_keyboard(models, page)
+            provider_slug = state.get("selected_provider", "")
+            keyboard, page_info = self._build_model_keyboard(models, page, provider_slug)
 
             pname = state.get("selected_provider_name", "")
-            provider_slug = state.get("selected_provider", "")
             provider = next(
                 (p for p in state["providers"] if p["slug"] == provider_slug),
                 None,

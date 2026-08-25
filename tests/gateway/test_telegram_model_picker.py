@@ -174,3 +174,36 @@ class TestTelegramModelPicker:
         selected.assert_awaited_once_with(
             "12345", "claude-sonnet-4-6", "antigravity-acp"
         )
+
+    def test_display_model_label_mapping(self):
+        adapter = _make_adapter()
+
+        # AGY Gemini
+        assert adapter._display_model_label("agy-gemini-flash-high-latest", "agy-gemini") == "Flash High"
+        assert adapter._display_model_label("agy-gemini-pro-high-latest", "agy-gemini") == "Pro High"
+
+        # AGY OSS / Claude
+        assert adapter._display_model_label("claude-sonnet-4-6", "agy-oss-claude") == "Sonnet 4.6"
+        assert adapter._display_model_label("claude-opus-4-6-thinking", "agy-oss-claude") == "Opus 4.6"
+        assert adapter._display_model_label("gpt-oss-120b-medium", "agy-oss-claude") == "GPT OSS 120B"
+
+        # Volc
+        assert adapter._display_model_label("ark-code-latest", "volcengine-coding-plan") == "Ark Code"
+        assert adapter._display_model_label("deepseek-v4-flash", "volcengine-coding-plan") == "DeepSeek Flash"
+        assert adapter._display_model_label("deepseek-v4-pro", "volcengine-coding-plan") == "DeepSeek Pro"
+        assert adapter._display_model_label("glm-5.3", "volcengine-coding-plan") == "GLM 5.3"
+        assert adapter._display_model_label("kimi-k2.7-code", "volcengine-coding-plan") == "Kimi Code"
+        assert adapter._display_model_label("doubao-seed-2.1-turbo", "volcengine-coding-plan") == "Doubao Turbo"
+        assert adapter._display_model_label("doubao-seed-evolving", "volcengine-coding-plan") == "Doubao Evolving"
+
+        # Codex
+        assert adapter._display_model_label("gpt-5.6-sol", "openai-codex") == "5.6 Sol"
+        assert adapter._display_model_label("gpt-5.6-sol-900k", "openai-codex") == "5.6 Sol 900k"
+        assert adapter._display_model_label("gpt-5.6-terra", "openai-codex") == "5.6 Terra"
+        assert adapter._display_model_label("gpt-5.5", "openai-codex") == "5.5"
+        assert adapter._display_model_label("gpt-5.4-mini", "openai-codex") == "5.4 Mini"
+        assert adapter._display_model_label("gpt-5.3-codex-spark", "openai-codex") == "5.3 Spark"
+
+        # Fallbacks
+        assert adapter._display_model_label("some-other-model", "other-provider") == "some-other-model"
+        assert adapter._display_model_label("provider/some-other-model", "other-provider") == "some-other-model"
